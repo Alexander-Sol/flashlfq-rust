@@ -21,8 +21,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use mzdata::io::MZReader;
+use mzdata::io::{DetailLevel, MZReader, ThermoRawReader};
 use mzdata::prelude::*;
+use mzdata::spectrum::Spectrum;
 
 use crate::tolerance::PpmTolerance;
 
@@ -663,33 +664,66 @@ impl ExtractedIonChromatogram {
 
 /// Reads the MS1 scans of a spectra file into the `Scan` shape the index consumes.
 ///
-/// Mirrors `PeakIndexingEngine.InitializeIndexingEngine(MsDataFile)`: keep only spectra
-/// whose MS level is 1 (survey scans), in file order (ascending scan number). Each scan's
-/// `(m/z, intensity)` arrays come from `raw_arrays()`; the one-based scan number is derived
-/// from the file index, and the retention time from `start_time()` (minutes).
+/// Mirrors `PeakIndexingEngine.InitializeIndexingEngine(MsDataFile)`: keep only spectra whose MS
+/// level is 1 (survey scans), in file order (ascending scan number). The one-based scan number is
+/// derived from the file index, and the retention time from `start_time()` (minutes).
 ///
-/// The format is sniffed by `MZReader::open_path`, so this transparently reads **mzML** and
-/// **Thermo `.raw`** (P2.1). `.raw` support rides the `thermorawfilereader` crate, which hosts a
-/// self-contained **.NET 8 runtime** — reading a `.raw` therefore requires a .NET 8 runtime on
-/// the machine (mzML stays pure-Rust). The zero-intensity filter below applies to both formats.
+/// **Thermo `.raw` is centroided on read** using the vendor (Thermo) algorithm. Orbitrap MS1 survey
+/// scans are acquired in *profile* mode (~9k sample points per scan), but the trace-kernel detector's
+/// isotope-comb model assumes **one peak per isotope**. Feeding it raw profile points inflates the
+/// peak count ~13×, samples each isotope off-apex, and double-counts profile shoulders in the summed
+/// intensity. So the Thermo reader is opened with `centroiding = true`, which returns the vendor
+/// centroid stream — the same peaks MetaMorpheus / FlashLFQ consume. mzML is read as stored (the
+/// calibrated Lumos mzML is already centroided; a profile mzML would come through as profile).
+///
+/// Peaks are extracted via [`SpectrumLike::peaks`], which yields the centroid list for a centroided
+/// spectrum and the raw profile arrays otherwise. Its iteration order is **not** guaranteed
+/// m/z-ascending, so the pairs are sorted (the invariant [`PeakIndexingEngine::index_peaks`] and
+/// [`crate::feature_refinement::refine_feature`] rely on) before the zero-intensity filter.
+///
+/// `.raw` support rides the `thermorawfilereader` crate, which hosts a self-contained **.NET 8
+/// runtime** — reading a `.raw` therefore requires a .NET 8 runtime on the machine (mzML stays
+/// pure-Rust).
 pub fn read_ms1_scans<P: Into<PathBuf> + Clone>(path: P) -> std::io::Result<Vec<Scan>> {
-    let reader = MZReader::open_path(path)?;
+    let path: PathBuf = path.into();
+    let is_thermo_raw = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("raw"))
+        .unwrap_or(false);
+
+    if is_thermo_raw {
+        // Vendor-centroid the profile Thermo scans on read (see doc above).
+        let reader =
+            ThermoRawReader::new_with_detail_level_and_centroiding(path, DetailLevel::Full, true)?;
+        Ok(collect_ms1_scans(reader))
+    } else {
+        let reader = MZReader::open_path(path)?;
+        Ok(collect_ms1_scans(reader))
+    }
+}
+
+/// Extracts MS1 scans from any spectrum iterator (mzML or Thermo). Shared by both branches of
+/// [`read_ms1_scans`]; see its docs for the centroiding and ordering rationale.
+fn collect_ms1_scans<I: Iterator<Item = Spectrum>>(reader: I) -> Vec<Scan> {
     let mut scans = Vec::new();
     for spectrum in reader {
         if spectrum.ms_level() != 1 {
             continue;
         }
-        let (mz, intensity) = match spectrum.raw_arrays() {
-            Some(arrays) => {
-                let mz = arrays.mzs().map(|c| c.into_owned()).unwrap_or_default();
-                let intensity = arrays
-                    .intensities()
-                    .map(|c| c.iter().map(|&v| v as f64).collect())
-                    .unwrap_or_default();
-                (mz, intensity)
-            }
-            None => (Vec::new(), Vec::new()),
-        };
+        // `peaks()` yields the centroid list for a centroided spectrum, raw profile points otherwise.
+        let peaks = spectrum.peaks();
+        let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(peaks.len());
+        for p in peaks.iter() {
+            pairs.push((p.mz, p.intensity as f64));
+        }
+        // Not guaranteed m/z-ordered; sort to satisfy the ascending-m/z invariant of the index.
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut mz = Vec::with_capacity(pairs.len());
+        let mut intensity = Vec::with_capacity(pairs.len());
+        for (m, i) in pairs {
+            mz.push(m);
+            intensity.push(i);
+        }
         let (mz, intensity) = remove_zero_intensity_peaks(mz, intensity);
         scans.push(Scan {
             mz,
@@ -699,7 +733,7 @@ pub fn read_ms1_scans<P: Into<PathBuf> + Clone>(path: P) -> std::io::Result<Vec<
             msn_order: spectrum.ms_level() as i32,
         });
     }
-    Ok(scans)
+    scans
 }
 
 /// Intensity below which mzLib's mzML reader treats a peak as "zero" and drops it.

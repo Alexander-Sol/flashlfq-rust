@@ -35,13 +35,12 @@
 //!   Ties break by candidate count, then by summed contributing intensity. The strict "present in all
 //!   charges" is softened to "the max-support cluster" (design's "≥2 charges, weighted by support").
 
-use crate::deconvolution::{
-    averagine_intensities_from_mono, classic_deconvolute, ClassicDeconvolutionParameters,
-};
+use crate::deconvolution::{classic_deconvolute, ClassicDeconvolutionParameters};
 use crate::isotopic_envelope::{mass_to_mz_f64, C13_MINUS_C12};
 use crate::peak_indexing::Scan;
 use crate::spectral_averaging::{average_spectra, SpectralAveragingParameters};
 use crate::trace_kernel::DetectedFeature;
+use std::collections::HashMap;
 
 /// Absolute mass-clustering floor (Da) for small masses, where a ppm window would be tighter than
 /// real mass precision. Applied as `max(mass · ppm/1e6, MASS_CLUSTER_ABS_FLOOR_DA)`.
@@ -188,11 +187,11 @@ pub fn refine_feature(
             da.total_cmp(&db)
         })?;
 
-    // NOTE: an averagine off-by-one corrector ([`correct_monoisotope_offbyone`]) is implemented and
-    // unit-tested, but on the real K562/CA data it *regressed* PSM recall (it flipped more correct
-    // monos than it fixed — the cosine metric is not yet discriminative enough on real, chimeric
-    // composites). It is therefore deliberately **not** applied here; the deconvolution's mono is
-    // trusted. Re-enable only once the corrector is made strictly non-regressive (see its docs).
+    // The deconvolution's monoisotope is trusted here. A per-feature off-by-one corrector was attempted
+    // twice — a cosine envelope match and a detector-comb-anchor snap — and BOTH regressed reference
+    // recall on chimeric composites (the snap: 88.4% → 80.8%), because the discriminating signal is too
+    // weak on real co-eluting data. Off-by-one is deferred to dedicated discriminator work; where
+    // co-eluting charges agree, `resolve_charge_state_consensus` already corrects it downstream.
     Some(RefinedFeature {
         detected: feature.clone(),
         refined_monoisotopic_mass: best.monoisotopic_mass,
@@ -200,96 +199,6 @@ pub fn refine_feature(
         candidate_masses: best.monoisotopic_mass_predictions.clone(),
         decon_score: best.score,
     })
-}
-
-/// Cosine-similarity margin an off-by-one shift must beat the deconvolution's own mono by before the
-/// corrector will move it. Keeps the correction conservative — it never overrides a correct
-/// deconvolution on noise-level differences.
-#[allow(dead_code)]
-const OFFBYONE_COSINE_MARGIN: f64 = 0.03;
-
-/// Averagine off-by-one correction. `classic_deconvolute` occasionally anchors the monoisotope one
-/// (or two) ¹³C units too high (it locked onto a heavier isotope) or one too low (it swept in a
-/// noise peak just below the true mono). Given the averaged composite and the deconvolution's
-/// `(mono_mass, charge)`, this scores candidate monos shifted by `s ∈ {0, −1, −2, +1}` ¹³C units by
-/// the cosine similarity between the observed composite intensities at the isotope positions and the
-/// expected averagine envelope anchored at that candidate, and returns the best-scoring candidate.
-/// It only moves off the deconvolution's mono on a clear improvement (`OFFBYONE_COSINE_MARGIN`).
-///
-/// Not currently wired into [`refine_feature`] — see the note there (it regressed real-data recall).
-#[allow(dead_code)]
-fn correct_monoisotope_offbyone(
-    comp_mz: &[f64],
-    comp_intensity: &[f64],
-    mono_mass: f64,
-    charge: i32,
-    ppm: f64,
-) -> f64 {
-    const K_MAX: usize = 6;
-    let score = |cand: f64| -> f64 {
-        let expected = averagine_intensities_from_mono(cand, 1e-3, K_MAX);
-        if expected.len() < 2 {
-            return 0.0;
-        }
-        let observed: Vec<f64> = (0..expected.len())
-            .map(|k| {
-                let mz = mass_to_mz_f64(cand + k as f64 * C13_MINUS_C12, charge);
-                composite_intensity_at(comp_mz, comp_intensity, mz, ppm)
-            })
-            .collect();
-        cosine(&expected, &observed)
-    };
-
-    let mut best_mass = mono_mass;
-    let mut best_score = score(mono_mass);
-    for s in [-1.0, -2.0, 1.0] {
-        let cand = mono_mass + s * C13_MINUS_C12;
-        if cand <= 0.0 {
-            continue;
-        }
-        let sc = score(cand);
-        if sc > best_score + OFFBYONE_COSINE_MARGIN {
-            best_score = sc;
-            best_mass = cand;
-        }
-    }
-    best_mass
-}
-
-/// Intensity of the composite peak closest to `target_mz` within `ppm`, or 0.0 if none. `comp_mz`
-/// is ascending (as `average_spectra` returns it), so the two neighbours of the insertion point are
-/// the only candidates.
-#[allow(dead_code)]
-fn composite_intensity_at(comp_mz: &[f64], comp_intensity: &[f64], target_mz: f64, ppm: f64) -> f64 {
-    if comp_mz.is_empty() {
-        return 0.0;
-    }
-    let i = comp_mz.partition_point(|&m| m < target_mz);
-    let mut best = 0.0;
-    let mut best_d = f64::INFINITY;
-    for cand in [i.checked_sub(1), Some(i)].into_iter().flatten() {
-        if cand < comp_mz.len() {
-            let d = (comp_mz[cand] - target_mz).abs();
-            if d < best_d && d / target_mz * 1e6 <= ppm {
-                best_d = d;
-                best = comp_intensity[cand];
-            }
-        }
-    }
-    best
-}
-
-/// Cosine similarity between two equal-length vectors; 0.0 if either has zero norm.
-#[allow(dead_code)]
-fn cosine(a: &[f64], b: &[f64]) -> f64 {
-    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let nb: f64 = b.iter().map(|y| y * y).sum::<f64>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
-    }
 }
 
 /// Resolves refined features into peptide features by grouping co-eluting charge states of the same
@@ -305,12 +214,39 @@ pub fn resolve_charge_state_consensus(
     mass_tolerance_ppm: f64,
     rt_tolerance_minutes: f64,
 ) -> Vec<ResolvedFeature> {
-    let n = refined.len();
-    if n == 0 {
+    if refined.is_empty() {
         return Vec::new();
     }
 
-    // Union-find over pairwise linkage.
+    group_features(refined, mass_tolerance_ppm, rt_tolerance_minutes)
+        .into_iter()
+        .map(|idxs| {
+            let members: Vec<RefinedFeature> = idxs.iter().map(|&i| refined[i].clone()).collect();
+            resolve_group(members, mass_tolerance_ppm)
+        })
+        .collect()
+}
+
+/// Groups refined features into single-linkage connected components under [`features_link`], returning
+/// each component as its member indices. Component order and within-component order are ascending by
+/// first-seen index, so the result depends **only** on the linkage partition — not on the order edges
+/// were discovered.
+///
+/// Spatially pruned to ~O(n log n) instead of the naive O(n²) all-pairs scan. Both arms of
+/// `features_link` are *local*: a partner co-elutes (`|Δapex_rt| ≤ rt_tol`) and its mass sits within a
+/// bounded ±¹³C-off-by-one band of ours. So we bucket features by RT bin (`floor(apex_rt / rt_tol)`; a
+/// partner within `rt_tol` lies in `bin ± 1`) with each bucket sorted by mass, then within those ≤3
+/// buckets binary-search a mass window that is a *superset* of every off-by-one hit. The **exact**
+/// `features_link` predicate is still applied to each surviving candidate — the window only prunes,
+/// it never decides — so the connected components are byte-identical to the all-pairs version.
+fn group_features(
+    refined: &[RefinedFeature],
+    mass_tolerance_ppm: f64,
+    rt_tolerance_minutes: f64,
+) -> Vec<Vec<usize>> {
+    let n = refined.len();
+
+    // Union-find.
     let mut parent: Vec<usize> = (0..n).collect();
     fn find(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
@@ -319,13 +255,85 @@ pub fn resolve_charge_state_consensus(
         }
         x
     }
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if features_link(&refined[i], &refined[j], mass_tolerance_ppm, rt_tolerance_minutes) {
-                let ri = find(&mut parent, i);
-                let rj = find(&mut parent, j);
-                if ri != rj {
-                    parent[ri] = rj;
+
+    // The RT binning divides by `rt_tol`; a non-positive or non-finite tolerance makes that
+    // meaningless, so fall back to the exact all-pairs scan (this config does not occur in practice
+    // and keeps exactness the priority).
+    if !(rt_tolerance_minutes.is_finite() && rt_tolerance_minutes > 0.0) {
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if features_link(&refined[i], &refined[j], mass_tolerance_ppm, rt_tolerance_minutes) {
+                    let ri = find(&mut parent, i);
+                    let rj = find(&mut parent, j);
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
+                }
+            }
+        }
+    } else {
+        let rt_tol = rt_tolerance_minutes;
+        let bin_of = |rt: f64| -> i64 { (rt / rt_tol).floor() as i64 };
+
+        // Bucket indices by RT bin, each bucket sorted ascending by refined mass; carry a parallel
+        // mass array so the candidate sub-range is a binary search.
+        let mut buckets: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (i, feat) in refined.iter().enumerate() {
+            buckets
+                .entry(bin_of(feat.detected.apex_rt))
+                .or_default()
+                .push(i);
+        }
+        let mut bucket_masses: HashMap<i64, Vec<f64>> = HashMap::with_capacity(buckets.len());
+        for (bin, idxs) in buckets.iter_mut() {
+            idxs.sort_by(|&a, &b| {
+                refined[a]
+                    .refined_monoisotopic_mass
+                    .total_cmp(&refined[b].refined_monoisotopic_mass)
+            });
+            bucket_masses.insert(
+                *bin,
+                idxs.iter()
+                    .map(|&i| refined[i].refined_monoisotopic_mass)
+                    .collect(),
+            );
+        }
+
+        for i in 0..n {
+            let mi = refined[i].refined_monoisotopic_mass;
+            // Widest mass reach: the ±MAX_OFFBYONE_UNITS ¹³C band plus the ppm window (the ppm term
+            // is relative to the partner mass, which at the band edge equals `mi`), plus a small
+            // absolute epsilon to defend the binary-search boundary against float round-off. This is
+            // a superset window — false candidates are removed by the exact predicate below.
+            let w = MAX_OFFBYONE_UNITS as f64 * C13_MINUS_C12
+                + mass_tolerance_ppm * 1e-6 * mi.abs()
+                + 1e-6;
+            let lo_mass = mi - w;
+            let hi_mass = mi + w;
+            let bi = bin_of(refined[i].detected.apex_rt);
+            for b in (bi - 1)..=(bi + 1) {
+                let Some(idxs) = buckets.get(&b) else {
+                    continue;
+                };
+                let masses = &bucket_masses[&b];
+                let start = masses.partition_point(|&m| m < lo_mass);
+                let end = masses.partition_point(|&m| m <= hi_mass);
+                for &j in &idxs[start..end] {
+                    if j == i {
+                        continue;
+                    }
+                    if features_link(
+                        &refined[i],
+                        &refined[j],
+                        mass_tolerance_ppm,
+                        rt_tolerance_minutes,
+                    ) {
+                        let ri = find(&mut parent, i);
+                        let rj = find(&mut parent, j);
+                        if ri != rj {
+                            parent[ri] = rj;
+                        }
+                    }
                 }
             }
         }
@@ -347,14 +355,7 @@ pub fn resolve_charge_state_consensus(
         };
         groups[g].push(i);
     }
-
     groups
-        .into_iter()
-        .map(|idxs| {
-            let members: Vec<RefinedFeature> = idxs.iter().map(|&i| refined[i].clone()).collect();
-            resolve_group(members, mass_tolerance_ppm)
-        })
-        .collect()
 }
 
 /// Whether two refined features should be grouped: co-elution AND off-by-one-aware neutral-mass
@@ -697,43 +698,6 @@ mod tests {
         );
     }
 
-    /// Builds a clean averagine composite anchored at `true_mono`/`charge` (m/z ascending), for the
-    /// off-by-one corrector tests.
-    fn averagine_composite(true_mono: f64, charge: i32) -> (Vec<f64>, Vec<f64>) {
-        let env = averagine_intensities_from_mono(true_mono, 1e-3, 8);
-        let mz: Vec<f64> = (0..env.len())
-            .map(|k| mass_to_mz_f64(true_mono + k as f64 * C13_MINUS_C12, charge))
-            .collect();
-        (mz, env)
-    }
-
-    #[test]
-    fn corrector_fixes_off_by_one_high() {
-        // Deconvolution anchored the mono one ¹³C too high; the corrector must shift it back down.
-        let true_mono = 1500.0;
-        let charge = 2;
-        let (mz, inten) = averagine_composite(true_mono, charge);
-        let wrong = true_mono + C13_MINUS_C12;
-        let corrected = correct_monoisotope_offbyone(&mz, &inten, wrong, charge, 20.0);
-        assert!(
-            (corrected - true_mono).abs() < 1e-6,
-            "expected correction to {true_mono}, got {corrected}"
-        );
-    }
-
-    #[test]
-    fn corrector_leaves_correct_mono_untouched() {
-        // A composite already anchored at the true mono must not be moved.
-        let true_mono = 1500.0;
-        let charge = 2;
-        let (mz, inten) = averagine_composite(true_mono, charge);
-        let corrected = correct_monoisotope_offbyone(&mz, &inten, true_mono, charge, 20.0);
-        assert!(
-            (corrected - true_mono).abs() < 1e-6,
-            "corrector should not move a correct mono; got {corrected}"
-        );
-    }
-
     #[test]
     fn singleton_group_falls_back_to_refined_mass() {
         let m = make_refined(2, 1234.5678, vec![1234.5678, 1234.5690], 30.0, 1.0e6);
@@ -746,5 +710,96 @@ mod tests {
             r.monoisotopic_mass, 1234.5678,
             "singleton resolves to its own refined mass"
         );
+    }
+
+    /// Reference O(n²) all-pairs grouping — the exact semantics the bucketed [`group_features`] must
+    /// reproduce. Same union-find and same first-seen component collection, so equality is byte-for-byte.
+    fn naive_groups(
+        refined: &[RefinedFeature],
+        mass_ppm: f64,
+        rt_tol: f64,
+    ) -> Vec<Vec<usize>> {
+        let n = refined.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if features_link(&refined[i], &refined[j], mass_ppm, rt_tol) {
+                    let ri = find(&mut parent, i);
+                    let rj = find(&mut parent, j);
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
+                }
+            }
+        }
+        let mut group_of: Vec<Option<usize>> = vec![None; n];
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            let g = match group_of[root] {
+                Some(g) => g,
+                None => {
+                    let g = groups.len();
+                    group_of[root] = Some(g);
+                    groups.push(Vec::new());
+                    g
+                }
+            };
+            groups[g].push(i);
+        }
+        groups
+    }
+
+    #[test]
+    fn bucketed_grouping_matches_naive_on_random_features() {
+        // Deterministic LCG (numerical-recipes constants) — no rand dependency, reproducible.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as f64 / (1u64 << 31) as f64 // in [0, 1)
+        };
+
+        let mass_ppm = 10.0;
+        let rt_tol = 0.1;
+
+        // Build ~2.5k features. Cluster masses around a few hundred base values, each drawn near a
+        // base ± an integer ¹³C offset (0/±1/±2) plus ppm-scale jitter, and apex RTs bunched into a
+        // handful of RT neighbourhoods — this deliberately exercises the off-by-one band, the RT-bin
+        // boundaries, and multi-charge co-elution the bucketing must not miss.
+        let n = 2500;
+        let mut feats: Vec<RefinedFeature> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let base = 600.0 + (next() * 300.0).floor() * 3.0; // discrete base masses ~600..1500
+            let off = ((next() * 5.0).floor() as i32 - 2) as f64 * C13_MINUS_C12; // -2..+2 ¹³C
+            let jitter = (next() - 0.5) * 2.0 * (mass_ppm * 1e-6 * base) * 1.5; // straddle the ppm edge
+            let mass = base + off + jitter;
+            let charge = 1 + (next() * 4.0).floor() as i32; // 1..4
+            // RT bunched into ~15 neighbourhoods, each a few multiples of rt_tol wide, so groups form.
+            let hub = (next() * 15.0).floor() * (rt_tol * 4.0) + 10.0;
+            let apex_rt = hub + (next() - 0.5) * 2.0 * rt_tol * 1.5; // straddle the ±1-bin boundary
+            feats.push(make_refined(charge, mass, vec![mass], apex_rt, 1.0e6 * (1.0 + next())));
+        }
+
+        let got = group_features(&feats, mass_ppm, rt_tol);
+        let want = naive_groups(&feats, mass_ppm, rt_tol);
+        assert_eq!(
+            got, want,
+            "bucketed grouping must equal naive O(n²) grouping (components and order)"
+        );
+
+        // Sanity: the fixture actually produced non-trivial structure (some multi-member groups),
+        // otherwise the test would pass vacuously.
+        assert!(
+            want.iter().any(|g| g.len() >= 2),
+            "fixture should form at least one multi-member group"
+        );
+        assert!(want.len() < feats.len(), "fixture should merge at least some features");
     }
 }

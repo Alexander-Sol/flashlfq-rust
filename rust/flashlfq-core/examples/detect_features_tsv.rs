@@ -21,8 +21,8 @@ use flashlfq_core::feature_refinement::{
 use flashlfq_core::isotopic_envelope::mass_to_mz_f64;
 use flashlfq_core::peak_indexing::{read_ms1_scans, PeakIndexingEngine};
 use flashlfq_core::trace_kernel::{
-    detect_features, median_ms1_scan_spacing_minutes, CombWeightModel, DetectedFeature,
-    TraceKernelParameters,
+    detect_features, estimate_noise_floor, median_ms1_scan_spacing_minutes, CombWeightModel,
+    DetectedFeature, ScoreModel, TraceKernelParameters, FWHM_TO_SIGMA,
 };
 
 /// Derives a sibling output path from the final path: `out.tsv` + tag `detected` -> `out.detected.tsv`.
@@ -115,23 +115,100 @@ fn main() {
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(36.0);
-    let params = TraceKernelParameters {
+    // Claim-extent trace knobs (Change A): missed-scan tolerance and the RT half-width guard for the
+    // XIC that follows a real elution beyond the ~2σ scoring window. TRACE_MAX_HALF_WIDTH_SEC is in
+    // seconds; default 30 s (0.5 min).
+    let trace_missed = std::env::var("TRACE_MISSED_SCANS")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(1);
+    let trace_half_width_min = std::env::var("TRACE_MAX_HALF_WIDTH_SEC")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|s| s / 60.0)
+        .unwrap_or(0.5);
+    // Chromatographic-persistence gate (Change A): reject features whose traced extent spans fewer
+    // than this many distinct scans. Default 2 drops single-scan noise doublets; MIN_FEATURE_SCANS=1
+    // disables it.
+    let min_feature_scans = std::env::var("MIN_FEATURE_SCANS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2);
+    // Seed intensity floor (bounds detection cost). Lower it to reach higher coverage (the default
+    // 1000 exhausts seeds ~90% ΣTIC on CA/Lumos before the coverage target is hit).
+    let min_seed_intensity = std::env::var("MIN_SEED_INTENSITY")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1000.0);
+    // Score model (Change B): SCORE_MODEL=normalized selects the noise-floor-truncated normalised
+    // correlation (default raw sum). NOISE_PCT is the percentile of peak intensity used as η (default 5).
+    let score_model = match std::env::var("SCORE_MODEL").as_deref() {
+        Ok("normalized") | Ok("normalised") => ScoreModel::NormalizedNoiseFloor,
+        _ => ScoreModel::RawSum,
+    };
+    let noise_pct = std::env::var("NOISE_PCT")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(5.0);
+    let noise_floor = if matches!(score_model, ScoreModel::NormalizedNoiseFloor) {
+        estimate_noise_floor(&engine, noise_pct)
+    } else {
+        0.0
+    };
+    // Change B variant knobs: AMP_SEED=1 uses the seed intensity as the apex amplitude A (vs the
+    // least-squares fit); SCORE_COSINE=1 divides additionally by ‖I‖ for a bounded cosine shape-fit.
+    let score_use_seed_amplitude = matches!(std::env::var("AMP_SEED").as_deref(), Ok("1") | Ok("true"));
+    let score_cosine = matches!(std::env::var("SCORE_COSINE").as_deref(), Ok("1") | Ok("true"));
+    let base = TraceKernelParameters {
         ppm_tolerance: 10.0,
-        min_seed_intensity: 1000.0,
+        min_seed_intensity,
         coverage_target,
         weight_model,
+        score_model,
+        noise_floor,
+        score_use_seed_amplitude,
+        score_cosine,
+        trace_missed_scans_allowed: trace_missed,
+        trace_max_half_width_minutes: trace_half_width_min,
+        min_feature_scans,
         ..TraceKernelParameters::default()
+    };
+    eprintln!(
+        "score model: {:?}  (η = {:.1} @ p{:.0}, A = {}, {})",
+        score_model,
+        noise_floor,
+        noise_pct,
+        if score_use_seed_amplitude { "seed" } else { "least-squares" },
+        if score_cosine { "cosine" } else { "template-norm" }
+    );
+    // σ from the data by default (Change A: measure FWHM via XIC half-max, ASSUMED_FWHM_SEC is the
+    // fallback). FIXED_SIGMA=1 forces the assumed-FWHM path for A/B comparison.
+    let data_driven_sigma = std::env::var("FIXED_SIGMA").is_err();
+    let params = if data_driven_sigma {
+        base.with_rt_from_index(&engine, assumed_fwhm_sec)
+    } else {
+        base.with_rt_from_scans(engine.scan_info(), assumed_fwhm_sec)
+    };
+    if data_driven_sigma {
+        eprintln!(
+            "σ source: data-driven (measured FWHM via XIC half-max; fallback {assumed_fwhm_sec} s) \
+             → {:.2} s FWHM",
+            params.rt_sigma_minutes * FWHM_TO_SIGMA * 60.0
+        );
+    } else {
+        eprintln!("σ source: assumed FWHM {assumed_fwhm_sec} s (FIXED_SIGMA)");
     }
-    .with_rt_from_scans(engine.scan_info(), assumed_fwhm_sec);
-    eprintln!("assumed FWHM: {assumed_fwhm_sec} s");
     eprintln!("comb weight model: {weight_model:?}");
     eprintln!(
-        "detecting (charge {}..={}, {} ppm, σ_rt {:.4} min, ±{} scans, seed floor {:.0}, coverage {:.0}%) ...",
+        "detecting (charge {}..={}, {} ppm, σ_rt {:.4} min, ±{} scans, trace: {} missed / {:.0} s half-width, min {} scans, seed floor {:.0}, coverage {:.0}%) ...",
         params.min_charge,
         params.max_charge,
         params.ppm_tolerance,
         params.rt_sigma_minutes,
         params.half_window_scans,
+        params.trace_missed_scans_allowed,
+        params.trace_max_half_width_minutes * 60.0,
+        params.min_feature_scans,
         params.min_seed_intensity,
         params.coverage_target * 100.0
     );

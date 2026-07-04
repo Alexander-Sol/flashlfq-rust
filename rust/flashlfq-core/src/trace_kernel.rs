@@ -66,6 +66,24 @@ pub enum CombWeightModel {
     Averagine,
 }
 
+/// How a charge hypothesis's matched-filter response is scored for cross-z non-max suppression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreModel {
+    /// Raw inner product `Σ (wₖ·gₛ·I)` over the observed comb slots. **Unnormalised** — it grows with
+    /// how many teeth/scans a hypothesis spans, so a broad or higher-charge comb can out-score the
+    /// correct one just by covering more of the window. The original detector score; kept as default
+    /// until the normalised model is validated to not regress.
+    RawSum,
+    /// **Noise-floor-truncated normalised correlation** (Change B). `score = Σ_S(wₖ·gₛ·I) /
+    /// sqrt(Σ_S (wₖ·gₛ)²)` over the *expected-observable support* `S = { (k,s) : A·wₖ·gₛ ≥ η }`, where
+    /// `A` is the matched-filter least-squares apex amplitude and `η` is the run-level noise floor
+    /// ([`TraceKernelParameters::noise_floor`]). Slots the model predicts fall **below** the noise
+    /// floor are dropped from both numerator and denominator (a faint real peak is not penalised for
+    /// teeth the instrument could never record); a slot in `S` with no observed peak stays in the
+    /// denominator and correctly penalises (a real miss). `η = 0` degenerates to a full-template norm.
+    NormalizedNoiseFloor,
+}
+
 /// Parameters governing the trace-kernel detector.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TraceKernelParameters {
@@ -83,6 +101,21 @@ pub struct TraceKernelParameters {
     pub half_window_scans: i32,
     /// Which comb-weight model to use.
     pub weight_model: CombWeightModel,
+    /// How the hypothesis response is scored (raw sum vs normalised; see [`ScoreModel`]).
+    pub score_model: ScoreModel,
+    /// Run-level noise floor `η` for [`ScoreModel::NormalizedNoiseFloor`] — comb slots whose
+    /// model-predicted intensity `A·wₖ·gₛ` falls below this are treated as unobservable and dropped
+    /// from the normalised score. `0.0` disables the truncation (full-template norm). Ignored by
+    /// [`ScoreModel::RawSum`]. Set from the data (e.g. [`estimate_noise_floor`]).
+    pub noise_floor: f64,
+    /// Apex-amplitude `A` estimator for [`ScoreModel::NormalizedNoiseFloor`]'s support set. `false`
+    /// (default) = matched-filter least-squares `A = Σ(t·I)/Σ(t²)` over observed slots; `true` = the
+    /// seed (most-abundant tooth) intensity. Only affects which slots clear `A·t ≥ η`.
+    pub score_use_seed_amplitude: bool,
+    /// If `true`, additionally divide the normalised score by `‖I‖` over the support `S`, giving a
+    /// bounded `[0, 1]` cosine shape-fit instead of the template-normalised correlation. Only applies
+    /// to [`ScoreModel::NormalizedNoiseFloor`]. Default `false`.
+    pub score_cosine: bool,
     /// Smallest envelope weight (relative to the tallest = 1) that still contributes a comb tooth.
     pub min_isotope_weight: f64,
     /// Hard cap on the number of comb teeth (isotopes) considered.
@@ -90,6 +123,11 @@ pub struct TraceKernelParameters {
     /// Minimum number of distinct comb teeth that must be observed for a hypothesis to be accepted.
     /// Two (a doublet) is the floor — a lone peak is not a feature.
     pub min_isotopes_observed: usize,
+    /// Minimum number of **distinct scans** the accepted feature's *traced extent* (Change A) must
+    /// span — a chromatographic-persistence gate. A real peptide elutes over several scans; a feature
+    /// claiming only one scan is a noise doublet (two peaks at comb spacing that happened to co-occur
+    /// in a single scan), not an elution. `1` disables the gate (any accepted hypothesis passes).
+    pub min_feature_scans: usize,
     /// Seeds with intensity below this are not considered (noise floor). `0.0` disables the floor
     /// and seeds from every peak. Because seeds are visited intensity-descending, this also bounds
     /// runtime: the seed loop stops as soon as it drops below the floor.
@@ -105,6 +143,17 @@ pub struct TraceKernelParameters {
     /// times — producing over-wide features that over-claim and split one elution into several.
     /// Typically ≈ 2σ (`with_rt_from_scans` sets it there). Supersedes `half_window_scans`.
     pub rt_half_window_minutes: f64,
+    /// Consecutive-miss tolerance for the **claim-extent XIC trace** (Change A). When an accepted
+    /// hypothesis claims its true elution, the most-abundant tooth is followed outward in RT via
+    /// [`crate::peak_indexing::PeakIndexingEngine::get_xic_by_scan_index`]; the walk stops after this
+    /// many consecutive scans with no matching peak. Small (1) so genuinely co-eluting neighbours of
+    /// the same m/z (separated by a valley) are not merged. Independent of the scoring window.
+    pub trace_missed_scans_allowed: i32,
+    /// Maximum RT half-width (minutes) the claim-extent trace may reach from the apex — the runaway
+    /// guard on the XIC walk. Decoupled from (and much wider than) the ~2σ *scoring* window: the whole
+    /// point of Change A is to claim a real elution wider than 2σ, so this bounds only pathological
+    /// traces, not real peaks.
+    pub trace_max_half_width_minutes: f64,
 }
 
 impl Default for TraceKernelParameters {
@@ -119,32 +168,196 @@ impl Default for TraceKernelParameters {
             rt_sigma_minutes: 0.1,
             half_window_scans: 3,
             weight_model: CombWeightModel::Averagine,
+            score_model: ScoreModel::RawSum,
+            noise_floor: 0.0,
+            score_use_seed_amplitude: false,
+            score_cosine: false,
             min_isotope_weight: 1e-3,
             max_isotopes: 12,
             min_isotopes_observed: 2,
+            min_feature_scans: 2,
             min_seed_intensity: 0.0,
             coverage_target: 1.0,
             rt_half_window_minutes: 0.5,
+            trace_missed_scans_allowed: 1,
+            trace_max_half_width_minutes: 0.5,
         }
     }
 }
 
 impl TraceKernelParameters {
-    /// Derives the RT σ and scan half-window from the data, given an assumed chromatographic peak
+    /// Derives the RT σ and scan half-window from the data, given an **assumed** chromatographic peak
     /// width. `assumed_fwhm_seconds` is the design's "~36 s peaks" starting assumption; the σ is
     /// `FWHM / 2.3548` and the half-window spans ±2σ in scans, using the median MS1 scan spacing.
     ///
     /// The FWHM (not the full peak width) drives the averaging window so co-eluting neighbours are
     /// not pulled into the composite; the same σ is reused as the detector's RT Gaussian width.
-    pub fn with_rt_from_scans(mut self, scan_info: &[ScanInfo], assumed_fwhm_seconds: f64) -> Self {
-        let fwhm_minutes = assumed_fwhm_seconds / 60.0;
-        let sigma_minutes = fwhm_minutes / FWHM_TO_SIGMA;
+    ///
+    /// Prefer [`Self::with_rt_from_index`] when the built index is available — it *measures* the FWHM
+    /// from the data instead of assuming it.
+    pub fn with_rt_from_scans(self, scan_info: &[ScanInfo], assumed_fwhm_seconds: f64) -> Self {
+        self.apply_fwhm(scan_info, assumed_fwhm_seconds)
+    }
+
+    /// Derives the RT σ and window from the run's **measured** chromatographic FWHM (Change A).
+    ///
+    /// Estimates the true FWHM from XIC half-max over a bounded sample of the tallest clean XICs (see
+    /// [`estimate_fwhm_seconds`]), clamps it to a sane `[FWHM_FLOOR_SEC, FWHM_CEIL_SEC]` band so a
+    /// pathological run cannot drive σ to a degenerate value, and sets σ / windows from it. Falls back
+    /// to `fallback_fwhm_seconds` (the assumed-FWHM path) when too few clean XICs are found.
+    ///
+    /// Unlike [`Self::with_rt_from_scans`], this needs the **built** [`PeakIndexingEngine`], so it
+    /// introduces an ordering dependency: build the index → finalize params with this → detect.
+    pub fn with_rt_from_index(self, engine: &PeakIndexingEngine, fallback_fwhm_seconds: f64) -> Self {
+        let ppm = PpmTolerance::new(self.ppm_tolerance);
+        let fwhm_seconds = estimate_fwhm_seconds(engine, &ppm)
+            .unwrap_or(fallback_fwhm_seconds)
+            .clamp(FWHM_FLOOR_SEC, FWHM_CEIL_SEC);
+        self.apply_fwhm(engine.scan_info(), fwhm_seconds)
+    }
+
+    /// Sets σ, the scan half-window, and the RT time-window from a chromatographic FWHM (seconds).
+    /// Shared by the assumed-FWHM ([`Self::with_rt_from_scans`]) and measured-FWHM
+    /// ([`Self::with_rt_from_index`]) constructors. Leaves the claim-extent trace knobs alone — those
+    /// are deliberately independent of the scoring σ.
+    fn apply_fwhm(mut self, scan_info: &[ScanInfo], fwhm_seconds: f64) -> Self {
+        let sigma_minutes = (fwhm_seconds / 60.0) / FWHM_TO_SIGMA;
         let spacing = median_ms1_scan_spacing_minutes(scan_info).max(f64::MIN_POSITIVE);
         self.rt_sigma_minutes = sigma_minutes;
         self.half_window_scans = ((2.0 * sigma_minutes) / spacing).round().max(1.0) as i32;
         // The matched filter is bounded in *time* (see `rt_half_window_minutes`); ±2σ covers the peak.
         self.rt_half_window_minutes = 2.0 * sigma_minutes;
         self
+    }
+}
+
+/// Lower clamp (seconds) for the measured-FWHM estimate — below this, σ would be so tight the RT
+/// Gaussian is essentially a delta and the window collapses to the apex scan.
+pub const FWHM_FLOOR_SEC: f64 = 1.0;
+/// Upper clamp (seconds) for the measured-FWHM estimate — above this we distrust the measurement (a
+/// pathological / co-eluting-dominated run) and cap it.
+pub const FWHM_CEIL_SEC: f64 = 60.0;
+
+/// Target number of clean XIC FWHM measurements to accumulate before taking the median.
+const FWHM_PROBE_SAMPLE_TARGET: usize = 500;
+/// Hard cap on seeds examined by the probe, so a run of mostly-unmeasurable XICs still returns
+/// promptly (bounded startup cost regardless of how many clean XICs exist).
+const FWHM_PROBE_MAX_SEEDS: usize = 20_000;
+/// Minimum clean measurements required to trust the median; below this the probe returns `None` and
+/// the caller falls back to the assumed FWHM.
+const FWHM_PROBE_MIN_SAMPLE: usize = 12;
+
+/// Estimates the run's chromatographic FWHM (**seconds**) from XIC half-max, over a bounded sample of
+/// the tallest clean XICs. Returns `None` when fewer than [`FWHM_PROBE_MIN_SAMPLE`] clean XICs are
+/// measurable (the caller then uses its assumed-FWHM fallback).
+///
+/// Bounded by design: seeds are visited tallest-first (each surviving XIC's peaks are marked so later
+/// seeds skip them, mirroring `get_all_xics`), stopping once [`FWHM_PROBE_SAMPLE_TARGET`] clean
+/// measurements are collected or [`FWHM_PROBE_MAX_SEEDS`] seeds have been examined. The median (not
+/// the mean) is returned, to resist tails and co-elution.
+pub fn estimate_fwhm_seconds(engine: &PeakIndexingEngine, ppm: &PpmTolerance) -> Option<f64> {
+    let mut seeds = engine.all_peaks();
+    seeds.sort_by(|a, b| b.intensity.total_cmp(&a.intensity));
+
+    let mut claimed: HashSet<PeakKey> = HashSet::new();
+    let mut widths: Vec<f64> = Vec::new();
+    let mut examined = 0usize;
+
+    for seed in &seeds {
+        if widths.len() >= FWHM_PROBE_SAMPLE_TARGET || examined >= FWHM_PROBE_MAX_SEEDS {
+            break;
+        }
+        if claimed.contains(&seed.key()) {
+            continue;
+        }
+        examined += 1;
+        // Generous RT cap (2 min) so a real peak is never clipped before its half-max shoulders.
+        let xic = engine.get_xic_by_scan_index(
+            seed.m() as f64,
+            seed.zero_based_scan_index,
+            ppm,
+            1,
+            2.0,
+            Some(&claimed),
+        );
+        for p in &xic {
+            claimed.insert(p.key());
+        }
+        if let Some(w) = xic_fwhm_minutes(&xic) {
+            widths.push(w);
+        }
+    }
+
+    if widths.len() < FWHM_PROBE_MIN_SAMPLE {
+        return None;
+    }
+    widths.sort_by(|a, b| a.total_cmp(b));
+    let n = widths.len();
+    let median_minutes = if n % 2 == 1 {
+        widths[n / 2]
+    } else {
+        (widths[n / 2 - 1] + widths[n / 2]) / 2.0
+    };
+    Some(median_minutes * 60.0)
+}
+
+/// FWHM (minutes) of one XIC via linear-interpolated half-max crossings. `None` if the trace has
+/// fewer than 3 points, the apex sits at an edge (not a real rise-then-fall), or it does not fall
+/// below half-max on both sides. Peaks must be RT-ascending (as `get_xic_by_scan_index` returns).
+fn xic_fwhm_minutes(xic: &[IndexedMassSpectralPeak]) -> Option<f64> {
+    let n = xic.len();
+    if n < 3 {
+        return None;
+    }
+    let pts: Vec<(f64, f64)> = xic
+        .iter()
+        .map(|p| (p.retention_time as f64, p.intensity as f64))
+        .collect();
+    // Apex = max-intensity sample; require it internal (a genuine rise-then-fall peak).
+    let mut ai = 0usize;
+    for i in 1..n {
+        if pts[i].1 > pts[ai].1 {
+            ai = i;
+        }
+    }
+    if ai == 0 || ai == n - 1 {
+        return None;
+    }
+    let half = pts[ai].1 / 2.0;
+    if half <= 0.0 {
+        return None;
+    }
+    // Left crossing: nearest sample left of apex at or below half, interpolated to `half`.
+    let mut left = None;
+    for i in (0..ai).rev() {
+        if pts[i].1 <= half {
+            let (t0, y0) = pts[i];
+            let (t1, y1) = pts[i + 1];
+            left = Some(if y1 != y0 {
+                t0 + (half - y0) * (t1 - t0) / (y1 - y0)
+            } else {
+                t0
+            });
+            break;
+        }
+    }
+    // Right crossing.
+    let mut right = None;
+    for i in (ai + 1)..n {
+        if pts[i].1 <= half {
+            let (t0, y0) = pts[i - 1];
+            let (t1, y1) = pts[i];
+            right = Some(if y1 != y0 {
+                t0 + (half - y0) * (t1 - t0) / (y1 - y0)
+            } else {
+                t1
+            });
+            break;
+        }
+    }
+    match (left, right) {
+        (Some(l), Some(r)) if r > l => Some(r - l),
+        _ => None,
     }
 }
 
@@ -212,6 +425,21 @@ pub fn poisson_comb_weights(neutral_mass: f64, min_weight: f64, max_isotopes: us
         }
     }
     weights
+}
+
+/// The isotope comb weights for a neutral mass under the configured [`CombWeightModel`]. Shared by
+/// the scorer and the claim-extent tracer so both lay the identical comb.
+fn comb_weights(neutral_mass: f64, params: &TraceKernelParameters) -> Vec<f64> {
+    match params.weight_model {
+        CombWeightModel::Poisson => {
+            poisson_comb_weights(neutral_mass, params.min_isotope_weight, params.max_isotopes)
+        }
+        CombWeightModel::Averagine => crate::deconvolution::averagine_comb_weights(
+            neutral_mass,
+            params.min_isotope_weight,
+            params.max_isotopes,
+        ),
+    }
 }
 
 /// Index of the most-abundant (tallest) tooth in a weight vector. Ties resolve to the lower index.
@@ -317,16 +545,7 @@ fn score_hypothesis(
 ) -> HypothesisScore {
     let seed_mz = seed.m() as f64;
     let seed_mass = mz_to_mass(seed_mz, charge);
-    let weights = match params.weight_model {
-        CombWeightModel::Poisson => {
-            poisson_comb_weights(seed_mass, params.min_isotope_weight, params.max_isotopes)
-        }
-        CombWeightModel::Averagine => crate::deconvolution::averagine_comb_weights(
-            seed_mass,
-            params.min_isotope_weight,
-            params.max_isotopes,
-        ),
-    };
+    let weights = comb_weights(seed_mass, params);
     // An empty envelope (e.g. a degenerate weight model) has no comb to lay — score it as a miss
     // rather than indexing into an empty vector.
     if weights.is_empty() {
@@ -342,42 +561,221 @@ fn score_hypothesis(
     let spacing = C13_MINUS_C12 / charge as f64;
     let mono_mz = seed_mz - (i_star as f64) * spacing;
 
-    let mut response = 0.0;
     let mut peaks: Vec<IndexedMassSpectralPeak> = Vec::new();
     let mut observed_isotopes: HashSet<usize> = HashSet::new();
     // Peaks already used *within this hypothesis*. For higher charges the comb spacing (1.0033/z) is
     // small, so two adjacent isotope slots can resolve to the same physical peak; without this a peak
     // would be double-counted in the response and intensity and would inflate the isotope count.
     let mut used: HashSet<PeakKey> = HashSet::new();
+    // Every comb (isotope k, scan s) slot as `(template = wₖ·gₛ, observed intensity)`. A missing or
+    // already-claimed/used peak keeps its template weight but contributes zero observed intensity, so
+    // the normalised score can penalise a predicted-but-absent tooth. `RawSum` only reads `t · I`.
+    let mut slots: Vec<(f64, f64)> = Vec::with_capacity(window.len() * weights.len());
 
     for &(s, g) in window {
         for (k, &wk) in weights.iter().enumerate() {
+            let template = wk * g;
             let expected_mz = mono_mz + (k as f64) * spacing;
-            let peak = match engine.get_indexed_peak(expected_mz, s, ppm) {
-                Some(p) => p,
-                None => continue,
+            let observed = if let Some(peak) = engine.get_indexed_peak(expected_mz, s, ppm) {
+                let key = peak.key();
+                if !claimed.contains(&key) && used.insert(key) {
+                    peaks.push(*peak);
+                    observed_isotopes.insert(k);
+                    peak.intensity as f64
+                } else {
+                    // Claimed by another feature, or already consumed by another slot of this
+                    // hypothesis — absent for this slot.
+                    0.0
+                }
+            } else {
+                0.0
             };
-            let key = peak.key();
-            if claimed.contains(&key) {
-                continue;
-            }
-            // Skip a peak already consumed by another isotope slot of this same hypothesis.
-            if !used.insert(key) {
-                continue;
-            }
-            response += wk * g * peak.intensity as f64;
-            peaks.push(*peak);
-            observed_isotopes.insert(k);
+            slots.push((template, observed));
         }
     }
 
     HypothesisScore {
-        response,
+        response: hypothesis_response(
+            &slots,
+            params.score_model,
+            params.noise_floor,
+            seed.intensity as f64,
+            params.score_use_seed_amplitude,
+            params.score_cosine,
+        ),
         charge,
         mono_mz,
         peaks,
         num_isotopes_observed: observed_isotopes.len(),
     }
+}
+
+/// Reduces a hypothesis's comb slots `(template = wₖ·gₛ, observed_intensity)` to the scalar response
+/// used for cross-z NMS, under the chosen [`ScoreModel`].
+///
+/// - [`ScoreModel::RawSum`]: `Σ (t · I)` — identical to the pre-Change-B accumulation.
+/// - [`ScoreModel::NormalizedNoiseFloor`]: estimate the apex amplitude `A` (least-squares
+///   `Σ(t·I)/Σ(t²)` over observed slots, or `seed_intensity` when `use_seed_amplitude`), form the
+///   expected-observable support `S = { slots : A·t ≥ η }`, and return the template-normalised
+///   correlation `Σ_S(t·I)/sqrt(Σ_S t²)` (or, when `cosine`, the bounded cosine
+///   `Σ_S(t·I)/(sqrt(Σ_S t²)·sqrt(Σ_S I²))`). Slots predicted below `η` are dropped from both sums;
+///   predicted-and-present teeth reward, predicted-and-absent teeth (in `S`) penalise.
+fn hypothesis_response(
+    slots: &[(f64, f64)],
+    model: ScoreModel,
+    noise_floor: f64,
+    seed_intensity: f64,
+    use_seed_amplitude: bool,
+    cosine: bool,
+) -> f64 {
+    match model {
+        ScoreModel::RawSum => slots.iter().map(|(t, i)| t * i).sum(),
+        ScoreModel::NormalizedNoiseFloor => {
+            let a = if use_seed_amplitude {
+                seed_intensity
+            } else {
+                let mut num_a = 0.0;
+                let mut den_a = 0.0;
+                for &(t, i) in slots {
+                    if i > 0.0 {
+                        num_a += t * i;
+                        den_a += t * t;
+                    }
+                }
+                if den_a <= 0.0 {
+                    return 0.0;
+                }
+                num_a / den_a
+            };
+            let mut num = 0.0;
+            let mut den_t = 0.0;
+            let mut den_i = 0.0;
+            for &(t, i) in slots {
+                if a * t >= noise_floor {
+                    num += t * i;
+                    den_t += t * t;
+                    den_i += i * i;
+                }
+            }
+            if den_t <= 0.0 {
+                return 0.0;
+            }
+            let template_norm = num / den_t.sqrt();
+            if cosine {
+                if den_i <= 0.0 {
+                    return 0.0;
+                }
+                template_norm / den_i.sqrt()
+            } else {
+                template_norm
+            }
+        }
+    }
+}
+
+/// Estimates the run-level MS1 noise floor `η` as a low percentile of the positive peak intensities —
+/// a simple global baseline for [`ScoreModel::NormalizedNoiseFloor`]. `percentile` is in `[0, 100]`
+/// (e.g. `5.0` for the 5th percentile). Returns `0.0` for an empty index (which disables the
+/// noise-floor truncation, i.e. a full-template norm).
+pub fn estimate_noise_floor(engine: &PeakIndexingEngine, percentile: f64) -> f64 {
+    let mut intensities: Vec<f64> = engine
+        .all_peaks()
+        .iter()
+        .map(|p| p.intensity as f64)
+        .filter(|&i| i > 0.0)
+        .collect();
+    if intensities.is_empty() {
+        return 0.0;
+    }
+    intensities.sort_by(|a, b| a.total_cmp(b));
+    let p = percentile.clamp(0.0, 100.0) / 100.0;
+    let idx = (((intensities.len() - 1) as f64) * p).round() as usize;
+    intensities[idx]
+}
+
+/// Traces the accepted hypothesis's **true elution extent** and returns the peaks the feature will
+/// claim (Change A). This decouples the *claim* from the narrow ~2σ *scoring* window: a real peak
+/// wider than 2σ is claimed whole, so its smaller adjacent seeds are already claimed and never fire —
+/// fragmentation never forms, and there is nothing to merge downstream.
+///
+/// Two steps:
+/// 1. **Extent.** Follow the most-abundant tooth (the seed's m/z — highest SNR, most reliable
+///    boundary) outward in RT with [`PeakIndexingEngine::get_xic_by_scan_index`], stopping on
+///    `trace_missed_scans_allowed` consecutive misses or the `trace_max_half_width_minutes` guard.
+///    Its peaks' scan indices give the extent `[s_lo, s_hi]`. Peaks already in `claimed` count as
+///    misses (a taller neighbour claimed them first), which is what splits co-eluting same-m/z peaks
+///    greedily instead of merging them.
+/// 2. **Gather.** Collect every comb tooth's peak at each scan in `[s_lo, s_hi]`, excluding anything
+///    already `claimed`. The union (deduped) is the feature's peak set — the single set that backs its
+///    RT bounds, summed intensity, coverage contribution, and the NMS claim mask alike.
+fn trace_claim_extent(
+    engine: &PeakIndexingEngine,
+    seed: &IndexedMassSpectralPeak,
+    hyp: &HypothesisScore,
+    params: &TraceKernelParameters,
+    ppm: &PpmTolerance,
+    claimed: &HashSet<PeakKey>,
+) -> Vec<IndexedMassSpectralPeak> {
+    let charge = hyp.charge;
+    let seed_mz = seed.m() as f64;
+    let weights = comb_weights(mz_to_mass(seed_mz, charge), params);
+    if weights.is_empty() {
+        // Degenerate comb — nothing to trace; claim the scored peaks (minus any already claimed).
+        return hyp
+            .peaks
+            .iter()
+            .filter(|p| !claimed.contains(&p.key()))
+            .copied()
+            .collect();
+    }
+    let spacing = C13_MINUS_C12 / charge as f64;
+    let mono_mz = hyp.mono_mz;
+    let apex_scan = seed.zero_based_scan_index;
+
+    // 1) Extent: follow the most-abundant tooth to fix the scan span.
+    let trace = engine.get_xic_by_scan_index(
+        seed_mz,
+        apex_scan,
+        ppm,
+        params.trace_missed_scans_allowed,
+        params.trace_max_half_width_minutes,
+        Some(claimed),
+    );
+    let mut s_lo = apex_scan;
+    let mut s_hi = apex_scan;
+    for p in &trace {
+        s_lo = s_lo.min(p.zero_based_scan_index);
+        s_hi = s_hi.max(p.zero_based_scan_index);
+    }
+
+    // 2) Gather every comb tooth's peaks across the extent, skipping already-claimed peaks and
+    //    de-duplicating (adjacent teeth of a high charge can resolve to the same physical peak).
+    let mut seen: HashSet<PeakKey> = HashSet::new();
+    let mut peaks: Vec<IndexedMassSpectralPeak> = Vec::new();
+    for k in 0..weights.len() {
+        let tooth_mz = mono_mz + (k as f64) * spacing;
+        for s in s_lo..=s_hi {
+            if let Some(p) = engine.get_indexed_peak(tooth_mz, s, ppm) {
+                let key = p.key();
+                if claimed.contains(&key) || !seen.insert(key) {
+                    continue;
+                }
+                peaks.push(*p);
+            }
+        }
+    }
+
+    // Defensive: never let an accepted feature end up with an empty peak set (the seed alone should
+    // always survive), which would break `build_feature`'s apex/extent derivation.
+    if peaks.is_empty() {
+        for p in &hyp.peaks {
+            let key = p.key();
+            if !claimed.contains(&key) && seen.insert(key) {
+                peaks.push(*p);
+            }
+        }
+    }
+    peaks
 }
 
 /// Runs the trace-kernel detector over an indexed run.
@@ -457,11 +855,26 @@ pub fn detect_features(
             continue;
         }
 
-        // Claim the feature's peaks so overlapping harmonics / neighbours cannot re-fire.
-        for p in &best.peaks {
+        // Claim the feature's TRUE traced extent (not just the narrow scored window), so the whole
+        // elution is claimed at once and its smaller adjacent seeds cannot re-fire as fragments.
+        let traced = trace_claim_extent(engine, seed, &best, params, &ppm, &claimed);
+
+        // Chromatographic-persistence gate: a real elution spans several scans; a feature whose
+        // traced extent covers fewer than `min_feature_scans` distinct scans is a single-scan noise
+        // doublet, not a peak. Retire the seed (as with the isotope-count gate) without emitting it.
+        if params.min_feature_scans > 1 {
+            let distinct_scans: HashSet<i32> =
+                traced.iter().map(|p| p.zero_based_scan_index).collect();
+            if distinct_scans.len() < params.min_feature_scans {
+                claimed.insert(seed.key());
+                continue;
+            }
+        }
+
+        for p in &traced {
             claimed.insert(p.key());
         }
-        let feature = build_feature(best);
+        let feature = build_feature(best, traced);
         explained_intensity += feature.summed_intensity;
         features.push(feature);
 
@@ -474,28 +887,29 @@ pub fn detect_features(
     features
 }
 
-/// Assembles a [`DetectedFeature`] from an accepted hypothesis (apex = tallest claimed peak;
-/// RT bounds and summed intensity from the claimed peaks). Consumes the hypothesis so its peak
-/// vector is moved into the feature rather than cloned.
-fn build_feature(hyp: HypothesisScore) -> DetectedFeature {
-    let apex = hyp
-        .peaks
+/// Assembles a [`DetectedFeature`] from an accepted hypothesis and its **traced** peak set (Change A).
+///
+/// The apex, RT bounds, and summed intensity are derived from `peaks` — the true traced extent from
+/// [`trace_claim_extent`], the same set that was written into the claim mask — so the reported RT
+/// bounds, the coverage/quant intensity, and the NMS claim are all backed by one peak set. The `score`
+/// stays the hypothesis's narrow matched-filter `response` (a shape-fit, deliberately not an
+/// extent-sum), and `num_isotopes_observed` stays the scored-window tooth count.
+fn build_feature(hyp: HypothesisScore, peaks: Vec<IndexedMassSpectralPeak>) -> DetectedFeature {
+    let apex = peaks
         .iter()
         .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
-        .expect("accepted hypothesis has at least one peak");
+        .expect("accepted feature has at least one traced peak");
     let apex_scan_index = apex.zero_based_scan_index;
     let apex_rt = apex.retention_time as f64;
-    let start_rt = hyp
-        .peaks
+    let start_rt = peaks
         .iter()
         .map(|p| p.retention_time as f64)
         .fold(f64::INFINITY, f64::min);
-    let end_rt = hyp
-        .peaks
+    let end_rt = peaks
         .iter()
         .map(|p| p.retention_time as f64)
         .fold(f64::NEG_INFINITY, f64::max);
-    let summed_intensity = hyp.peaks.iter().map(|p| p.intensity as f64).sum();
+    let summed_intensity = peaks.iter().map(|p| p.intensity as f64).sum();
 
     DetectedFeature {
         monoisotopic_mass: mz_to_mass(hyp.mono_mz, hyp.charge),
@@ -508,7 +922,7 @@ fn build_feature(hyp: HypothesisScore) -> DetectedFeature {
         summed_intensity,
         score: hyp.response,
         num_isotopes_observed: hyp.num_isotopes_observed,
-        peaks: hyp.peaks,
+        peaks,
     }
 }
 
@@ -656,6 +1070,78 @@ mod tests {
     }
 
     #[test]
+    fn raw_sum_response_is_plain_inner_product() {
+        // RawSum must equal Σ(template · observed); a missing tooth (observed 0) contributes nothing.
+        let slots = [(1.0, 10.0), (0.5, 4.0), (0.25, 0.0)];
+        approx(
+            hypothesis_response(&slots, ScoreModel::RawSum, 0.0, 0.0, false, false),
+            1.0 * 10.0 + 0.5 * 4.0,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn normalized_response_penalizes_missing_predicted_tooth() {
+        // Same tall tooth, but one hypothesis is missing a second tooth the template predicts well
+        // above the floor. It must rank below the complete one (the absent tooth stays in the norm).
+        let eta = 1.0;
+        let complete = hypothesis_response(&[(1.0, 100.0), (0.6, 60.0)], ScoreModel::NormalizedNoiseFloor, eta, 0.0, false, false);
+        let missing = hypothesis_response(&[(1.0, 100.0), (0.6, 0.0)], ScoreModel::NormalizedNoiseFloor, eta, 0.0, false, false);
+        assert!(
+            complete > missing,
+            "complete ({complete}) should beat a missing predicted tooth ({missing})"
+        );
+    }
+
+    #[test]
+    fn normalized_noise_floor_excludes_below_floor_teeth() {
+        // A faint tooth the model predicts BELOW the floor must not penalise: a hypothesis missing
+        // only that below-floor tooth scores the same as one where the slot never existed.
+        // A = 100 (from the tall tooth); a tooth with template 0.005 → A·t = 0.5 < η = 1.0 → excluded.
+        let eta = 1.0;
+        let with_faint = hypothesis_response(&[(1.0, 100.0), (0.005, 0.0)], ScoreModel::NormalizedNoiseFloor, eta, 0.0, false, false);
+        let without = hypothesis_response(&[(1.0, 100.0)], ScoreModel::NormalizedNoiseFloor, eta, 0.0, false, false);
+        approx(with_faint, without, 1e-9);
+    }
+
+    #[test]
+    fn normalized_score_still_selects_charge_two() {
+        // The normalised model must not break basic charge selection on a clean z=2 envelope.
+        let (scans, _) = synthetic_envelope_scans();
+        let engine = PeakIndexingEngine::index_peaks(&scans).expect("indexed");
+        let params = TraceKernelParameters {
+            ppm_tolerance: 5.0,
+            rt_sigma_minutes: 0.15,
+            half_window_scans: 4,
+            score_model: ScoreModel::NormalizedNoiseFloor,
+            noise_floor: 0.0,
+            ..TraceKernelParameters::default()
+        };
+        let features = detect_features(&engine, &params);
+        assert!(!features.is_empty(), "normalised model should still detect the envelope");
+        assert_eq!(features[0].charge, 2, "normalised score must still pick z=2");
+    }
+
+    #[test]
+    fn cosine_response_is_one_for_a_perfect_fit() {
+        // Observed I = A·t exactly for every slot → the cosine variant returns 1.0 (bounded shape-fit).
+        let a = 50.0;
+        let slots = [(1.0, a * 1.0), (0.5, a * 0.5), (0.25, a * 0.25)];
+        let r = hypothesis_response(&slots, ScoreModel::NormalizedNoiseFloor, 0.0, 0.0, false, true);
+        approx(r, 1.0, 1e-9);
+    }
+
+    #[test]
+    fn seed_amplitude_matches_ls_when_amplitudes_agree() {
+        // The LS amplitude of these observed slots is (100+36)/(1+0.36) = 100; passing seed_intensity
+        // = 100 to the seed-amplitude path must yield the same support S and thus the same score.
+        let slots = [(1.0, 100.0), (0.6, 60.0), (0.01, 0.0)];
+        let ls = hypothesis_response(&slots, ScoreModel::NormalizedNoiseFloor, 1.0, 0.0, false, false);
+        let seed = hypothesis_response(&slots, ScoreModel::NormalizedNoiseFloor, 1.0, 100.0, true, false);
+        approx(ls, seed, 1e-9);
+    }
+
+    #[test]
     fn claiming_prevents_double_detection() {
         // A single clean envelope should yield exactly one feature — its peaks get claimed, so no
         // second feature is assembled from the same signal.
@@ -783,5 +1269,233 @@ mod tests {
         let w = averagine_intensities_from_mono(4000.0, 1e-4, 20);
         let mode = most_abundant_index(&w);
         assert!(mode >= 1, "heavy averagine mode should sit above the mono, got {mode}");
+    }
+
+    /// Builds a clean averagine-shaped z=`charge` envelope eluting across `n_scans` (0.1-min spacing
+    /// from `rt0`), with the RT Gaussian centred at local scan `apex_scan` and width `rt_sigma`. Every
+    /// scan in the span carries the full comb, so the elution is contiguous (no missed scans) and the
+    /// claim trace can cover the whole extent. `first_scan_number` sets the (cosmetic) one-based
+    /// numbering; the zero-based scan index comes from position in the concatenated scan array.
+    fn elution_scans(
+        mono_mass: f64,
+        charge: i32,
+        n_scans: i32,
+        apex_scan: i32,
+        rt_sigma: f64,
+        rt0: f64,
+        first_scan_number: i32,
+    ) -> Vec<Scan> {
+        let mono_mz = mass_to_mz_f64(mono_mass, charge);
+        let spacing = C13_MINUS_C12 / charge as f64;
+        let weights = averagine_intensities_from_mono(mono_mass, 1e-4, 12);
+        let apex_intensity = 1.0e7;
+        let mut scans = Vec::new();
+        for s in 0..n_scans {
+            let rt = rt0 + s as f64 * 0.1;
+            let g = gaussian(rt - (rt0 + apex_scan as f64 * 0.1), rt_sigma);
+            let mut mz = Vec::new();
+            let mut intensity = Vec::new();
+            for (k, &wk) in weights.iter().enumerate() {
+                mz.push(mono_mz + k as f64 * spacing);
+                intensity.push(apex_intensity * wk * g);
+            }
+            scans.push(Scan {
+                mz,
+                intensity,
+                one_based_scan_number: first_scan_number + s,
+                retention_time: rt,
+                msn_order: 1,
+            });
+        }
+        scans
+    }
+
+    #[test]
+    fn trace_claims_full_elution_not_just_scoring_window() {
+        // A z=2 elution ~1.5 min wide (16 scans). The SCORING window is deliberately narrow
+        // (±~0.12 min ≈ 1 scan each side) — the regime that used to split a wide peak into many
+        // seeds. Trace-following (Change A) must claim the WHOLE elution → exactly one feature that
+        // spans all 16 scans, with its RT bounds and peak set covering the true extent.
+        let n = 16;
+        let apex = 8;
+        let scans = elution_scans(1200.0, 2, n, apex, 0.35, 10.0, 1);
+        let engine = PeakIndexingEngine::index_peaks(&scans).expect("indexed");
+        let params = TraceKernelParameters {
+            ppm_tolerance: 5.0,
+            rt_sigma_minutes: 0.1,
+            rt_half_window_minutes: 0.12, // narrow scoring window on purpose
+            trace_missed_scans_allowed: 1,
+            trace_max_half_width_minutes: 1.5, // wide enough to follow the whole elution
+            ..TraceKernelParameters::default()
+        };
+        let features = detect_features(&engine, &params);
+        assert_eq!(
+            features.len(),
+            1,
+            "a wide elution must be ONE feature, not fragmented into many"
+        );
+        let f = &features[0];
+        assert_eq!(f.charge, 2);
+        approx(f.start_rt, 10.0, 1e-3);
+        approx(f.end_rt, 10.0 + (n - 1) as f64 * 0.1, 1e-3);
+        // The claim covers every scan of the elution across the comb teeth.
+        let distinct_scans: HashSet<i32> =
+            f.peaks.iter().map(|p| p.zero_based_scan_index).collect();
+        assert_eq!(
+            distinct_scans.len(),
+            n as usize,
+            "claim should span every scan of the elution, got {} of {n}",
+            distinct_scans.len()
+        );
+    }
+
+    #[test]
+    fn trace_stops_at_gap_between_co_eluting_same_mz_peaks() {
+        // Two z=2 elutions at the SAME m/z separated by a 3-scan empty gap. With
+        // trace_missed_scans_allowed = 1 the claim trace stops in the gap rather than merging the
+        // two, so greedy tallest-first detection yields TWO features, each on its own side.
+        let mut scans = elution_scans(1200.0, 2, 5, 2, 0.15, 10.0, 1); // A: idx 0..4, apex idx 2
+        for i in 0..3 {
+            // Empty gap scans — present in scan_info, so the scan-index gap is real.
+            scans.push(Scan {
+                mz: vec![],
+                intensity: vec![],
+                one_based_scan_number: 6 + i,
+                retention_time: 10.5 + i as f64 * 0.1,
+                msn_order: 1,
+            });
+        }
+        // B: same m/z, later RT, scaled down so A (taller) seeds and claims first.
+        let mut b = elution_scans(1200.0, 2, 5, 2, 0.15, 10.8, 9); // B: idx 8..12, apex idx 10
+        for s in &mut b {
+            for y in &mut s.intensity {
+                *y *= 0.4;
+            }
+        }
+        scans.extend(b);
+
+        let engine = PeakIndexingEngine::index_peaks(&scans).expect("indexed");
+        let params = TraceKernelParameters {
+            ppm_tolerance: 5.0,
+            rt_sigma_minutes: 0.15,
+            rt_half_window_minutes: 0.3,
+            trace_missed_scans_allowed: 1,
+            trace_max_half_width_minutes: 1.5,
+            ..TraceKernelParameters::default()
+        };
+        let features = detect_features(&engine, &params);
+        assert_eq!(
+            features.len(),
+            2,
+            "a valley gap must keep the two same-m/z elutions separate"
+        );
+        for f in &features {
+            assert!(
+                f.end_rt - f.start_rt < 0.6,
+                "feature spanning [{:.3}, {:.3}] merged across the gap",
+                f.start_rt,
+                f.end_rt
+            );
+        }
+    }
+
+    #[test]
+    fn min_feature_scans_rejects_single_scan_noise() {
+        // A 2-tooth envelope present in exactly ONE scan (neighbours empty), i.e. a single-scan
+        // noise doublet. It clears the isotope-count gate but its traced extent is one scan.
+        let mono_mass = 1200.0;
+        let charge = 2;
+        let mono_mz = mass_to_mz_f64(mono_mass, charge);
+        let spacing = C13_MINUS_C12 / charge as f64;
+        let weights = averagine_intensities_from_mono(mono_mass, 1e-4, 6);
+        let mut scans = Vec::new();
+        for s in 0..5 {
+            let (mz, intensity) = if s == 2 {
+                let mut mz = Vec::new();
+                let mut inten = Vec::new();
+                for (k, &wk) in weights.iter().enumerate() {
+                    mz.push(mono_mz + k as f64 * spacing);
+                    inten.push(1.0e7 * wk);
+                }
+                (mz, inten)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            scans.push(Scan {
+                mz,
+                intensity,
+                one_based_scan_number: s + 1,
+                retention_time: 10.0 + s as f64 * 0.1,
+                msn_order: 1,
+            });
+        }
+        let engine = PeakIndexingEngine::index_peaks(&scans).expect("indexed");
+        let base = TraceKernelParameters {
+            ppm_tolerance: 5.0,
+            rt_sigma_minutes: 0.1,
+            rt_half_window_minutes: 0.3,
+            ..TraceKernelParameters::default()
+        };
+
+        // Gate off (=1): the single-scan doublet is detected.
+        let allow = TraceKernelParameters { min_feature_scans: 1, ..base };
+        assert_eq!(
+            detect_features(&engine, &allow).len(),
+            1,
+            "with the persistence gate off, the single-scan doublet is a feature"
+        );
+
+        // Gate on (=2, the default): it is rejected as non-chromatographic.
+        let gate = TraceKernelParameters { min_feature_scans: 2, ..base };
+        assert!(
+            detect_features(&engine, &gate).is_empty(),
+            "min_feature_scans=2 must reject a feature whose traced extent is one scan"
+        );
+    }
+
+    #[test]
+    fn with_rt_from_index_measures_sigma_from_data() {
+        // Several clean elutions with a KNOWN RT width (σ_data = 0.15 min → FWHM ≈ 0.353 min ≈ 21 s).
+        // with_rt_from_index must recover σ ≈ 0.15 from XIC half-max — NOT the (different) fallback.
+        let mut scans = elution_scans(1500.0, 2, 15, 7, 0.15, 10.0, 1);
+        scans.extend(elution_scans(2000.0, 3, 15, 7, 0.15, 20.0, 100));
+        scans.extend(elution_scans(2500.0, 3, 15, 7, 0.15, 30.0, 200));
+        scans.extend(elution_scans(3000.0, 3, 15, 7, 0.15, 40.0, 300));
+        let engine = PeakIndexingEngine::index_peaks(&scans).expect("indexed");
+
+        let ppm = PpmTolerance::new(5.0);
+        let measured = estimate_fwhm_seconds(&engine, &ppm).expect("enough clean XICs to measure");
+        // ~21 s, well within the sane band.
+        approx(measured, 0.15 * FWHM_TO_SIGMA * 60.0, 3.0);
+
+        let params = TraceKernelParameters {
+            ppm_tolerance: 5.0,
+            ..TraceKernelParameters::default()
+        }
+        // Fallback 40 s (σ ≈ 0.283) is deliberately far from the true 0.15 so a wrong fallback shows.
+        .with_rt_from_index(&engine, 40.0);
+        approx(params.rt_sigma_minutes, 0.15, 0.03);
+        assert!(params.rt_half_window_minutes > 0.0);
+    }
+
+    #[test]
+    fn with_rt_from_index_falls_back_when_too_few_clean_xics() {
+        // A 2-scan blip has no measurable clean XIC (apex at an edge, < 3 points) → the estimator
+        // returns None → params take the fallback FWHM.
+        let scans = elution_scans(1000.0, 2, 2, 0, 0.15, 10.0, 1);
+        let engine = PeakIndexingEngine::index_peaks(&scans).expect("indexed");
+        let ppm = PpmTolerance::new(10.0);
+        assert!(
+            estimate_fwhm_seconds(&engine, &ppm).is_none(),
+            "a 2-scan run should not yield a measurable FWHM"
+        );
+
+        let fallback = 30.0;
+        let params = TraceKernelParameters::default().with_rt_from_index(&engine, fallback);
+        approx(
+            params.rt_sigma_minutes,
+            (fallback / 60.0) / FWHM_TO_SIGMA,
+            1e-9,
+        );
     }
 }
