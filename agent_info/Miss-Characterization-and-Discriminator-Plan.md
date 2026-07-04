@@ -66,6 +66,48 @@ The observed m/z is claimed by no feature at that RT. Investigate the mechanism 
 - RT apex just outside ±0.3 min (a matching-tolerance artifact, not a real miss)?
 Likely a mix; the breakdown decides whether this is a detector gap or a scoring/tolerance issue.
 
+## Track D — chimeric-region detection + linear unmixing (TODO)
+
+**Motivation (grounded by the envelope probe).** `examples/obo_envelope_probe.rs` (plots
+`analysis/obo_composite_envelopes.png` / `obo_apex_envelopes.png`, notebook
+`analysis/obo_envelope_explorer.ipynb`) pulls the real observed envelope for off-by-one cases and runs
+classic decon on each scan + the averaged composite. It shows several off-by-one **and** detection-gap
+misses are **chimeric**: the local m/z window holds ≥2 overlapping isotope envelopes (co-eluting
+peptide, a harmonic charge, or an M−1 contaminant), and single-envelope classic decon — which anchors
+on the tallest peak and back-computes the mono from the averagine mode offset — is dragged off by the
+interferer. Examples: AVVQDPALK's intense M−1 peak (pushes mono to k=−1), TAGWNIPMGLLYSK swamped by a
+co-eluting z3, YENEVALR overlapping a z1 species. Averaging does **not** fix these (the composite is
+chimeric too), and single-charge refinement can't either.
+
+Build it in two parts:
+
+1. **Chimera detector.** Flag a feature's window/trace as chimeric when the observed envelope is not
+   explained by one averagine envelope: large residual after the best single-envelope fit; extra
+   unexplained peaks interleaved with (or just below) the teeth; multiple plausible charges sharing the
+   window; or an XIC whose trace shape is a blend (co-eluting apexes at slightly offset RT). Runs on the
+   composite (and optionally per-scan traces) and gates the (more expensive) unmixing step below.
+2. **Linear unmixing.** Model the complex region as a **non-negative linear combination of K averagine
+   envelopes**: solve `min ‖Xw − y‖, w ≥ 0`, where the columns of `X` are candidate `(mono, charge)`
+   averagine templates sampled onto the window's m/z grid and `y` is the observed composite. Pick K by a
+   sparsity/BIC penalty (reject spurious components); each surviving, adequately-supported component
+   becomes its own resolved feature. This resolves the chimeric **off-by-one** (the correct mono emerges
+   as the component that explains the *whole* envelope, not just the tallest peak) and recovers
+   **detection gaps** (a weak envelope buried under a strong neighbour surfaces as its own component).
+
+Design constraints:
+- Keep the parity-locked `deconvolution.rs` untouched. Unmixing is new work in a dedicated module
+  (e.g. `envelope_unmixing.rs`) consumed by `feature_refinement` — same rule as the A2 corrector.
+- Candidate templates: enumerate `charge ∈ min..max` × `mono` at each observed peak's implied neutral
+  mass ± a couple ¹³C; the averagine model already exists (`deconvolution::averagine_intensities_from_mono`).
+- Cost control: run NNLS only on windows the chimera detector flags, not every feature.
+- Validate on the 4 probe cases first (known answers), then the full 47 off-by-ones + 15 detection gaps.
+  Acceptance = net recall up, charge-match not down, the 548 currently-matched not regressing (same
+  per-ref-diff bar as Tracks A/B).
+
+This is heavier than A1/A2 but **subsumes several miss classes at once** (chimeric off-by-one + some
+detection gaps + wrong-charge harmonics), so it may ultimately replace/complement A2 for the chimeric
+subset.
+
 ## Sequencing
 
 1. **A1** (consensus tiebreak) — cheapest, likely non-regressive, addresses 21.
@@ -73,6 +115,9 @@ Likely a mix; the breakdown decides whether this is a detector gap or a scoring/
 3. **Track B** (charge prior) — targets 10, follow-up to Change B.
 4. **A2** (single-charge discriminator) — hardest, most regression-prone; do last with calibrated-file
    validation.
+5. **Track D** (chimera detection + linear unmixing) — heaviest; new module. Tackles the chimeric
+   subset that A2 can't, plus detection gaps and harmonic wrong-charge. Build after A1/C triage; it may
+   subsume A2 for chimeric windows.
 
 After each: re-run the default pipeline end-to-end, report the per-ref diff (fixed vs newly-broken),
 recall, and charge-match. Ship only on a net gain with no charge regression.
