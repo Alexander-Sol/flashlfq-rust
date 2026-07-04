@@ -33,12 +33,63 @@ use flashlfq_core::tolerance::PpmTolerance;
 
 /// One reference off-by-one case to dig into.
 struct Target {
-    label: &'static str,
+    label: String,
     ref_mono: f64, // theoretical neutral monoisotopic mass from the reference
     rt: f64,       // reference peak RT apex (min)
     z: i32,        // reference peak charge
     pk_mz: f64,    // reference "Peak MZ" — the observed most-abundant isotope m/z
     reported_k: i32, // the ¹³C offset at which the detector placed a feature (from offbyone_diag)
+}
+
+/// Loads the target list from the `OBO_TARGETS` TSV (columns: label, ref_mono, rt, z, pk_mz,
+/// reported_k — as written by `analysis/make_obo_targets.py`). Falls back to a small built-in set
+/// when the env var is unset or the file is unreadable.
+fn load_targets() -> Vec<Target> {
+    if let Ok(path) = std::env::var("OBO_TARGETS") {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let mut out = Vec::new();
+                for line in text.lines().skip(1) {
+                    let c: Vec<&str> = line.split('\t').collect();
+                    if c.len() < 6 {
+                        continue;
+                    }
+                    out.push(Target {
+                        label: c[0].to_string(),
+                        ref_mono: c[1].parse().unwrap_or(0.0),
+                        rt: c[2].parse().unwrap_or(0.0),
+                        z: c[3].parse().unwrap_or(0),
+                        pk_mz: c[4].parse().unwrap_or(0.0),
+                        reported_k: c[5].parse().unwrap_or(0),
+                    });
+                }
+                eprintln!("loaded {} targets from {path}", out.len());
+                return out;
+            }
+            Err(e) => eprintln!("OBO_TARGETS={path} unreadable ({e}); using built-in cases"),
+        }
+    }
+    builtin_targets()
+}
+
+/// The original four hand-picked cases, used when `OBO_TARGETS` is not provided.
+fn builtin_targets() -> Vec<Target> {
+    [
+        ("YENEVALR", 992.4927, 11.71, 2, 497.2584, 1),
+        ("VLDELTLTK", 1030.5910, 13.84, 2, 516.3077, -1),
+        ("TAGWNIPMGLLYSK", 1549.7963, 16.50, 2, 775.9128, -1),
+        ("AVVQDPALKP(z3)", 2198.1947, 15.91, 3, 734.0803, -1),
+    ]
+    .iter()
+    .map(|&(label, ref_mono, rt, z, pk_mz, reported_k)| Target {
+        label: label.to_string(),
+        ref_mono,
+        rt,
+        z,
+        pk_mz,
+        reported_k,
+    })
+    .collect()
 }
 
 /// Neutral mass -> m/z at charge z (positive mode, proton adduct).
@@ -123,14 +174,9 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| r"D:\SP_Tutorial\Lumos\04-17-23_CA_Tryp_HCD_10min.raw".to_string());
 
-    // Off-by-one cases pulled from offbyone_diag / obo_list. Clean single-charge-carrier peptides
-    // spanning both k directions, plus one higher-mass multi-charge case.
-    let targets = [
-        Target { label: "YENEVALR",       ref_mono: 992.4927,  rt: 11.71, z: 2, pk_mz: 497.2584,  reported_k: 1 },
-        Target { label: "VLDELTLTK",      ref_mono: 1030.5910, rt: 13.84, z: 2, pk_mz: 516.3077,  reported_k: -1 },
-        Target { label: "TAGWNIPMGLLYSK", ref_mono: 1549.7963, rt: 16.50, z: 2, pk_mz: 775.9128,  reported_k: -1 },
-        Target { label: "AVVQDPALKP(z3)", ref_mono: 2198.1947, rt: 15.91, z: 3, pk_mz: 734.0803,  reported_k: -1 },
-    ];
+    // Off-by-one cases: from the OBO_TARGETS TSV (all ~47, via make_obo_targets.py) if set, else a
+    // small built-in set.
+    let targets = load_targets();
 
     eprintln!("reading MS1 scans from {spectra_path} ...");
     let scans = read_ms1_scans(&spectra_path).expect("failed to read spectra file");

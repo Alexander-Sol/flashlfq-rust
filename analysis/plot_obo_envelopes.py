@@ -12,7 +12,7 @@ Produces obo_composite_envelopes.png (averaged composite) and obo_apex_envelopes
 
 Run:  python analysis/plot_obo_envelopes.py analysis
 """
-import csv, os, sys
+import csv, os, sys, math
 from collections import defaultdict
 import matplotlib
 matplotlib.use("Agg")
@@ -83,16 +83,21 @@ def draw(ax, case, obs_key):
     ax.grid(True, alpha=0.15)
 
 
-def make_figure(obs_key, title, outfile):
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
-    for ax, case in zip(axes.flat, order):
+def make_figure(obs_key, title, outfile, ncols=4):
+    n = len(order)
+    nrows = math.ceil(n / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 3.0 * nrows), squeeze=False)
+    flat = axes.flat
+    for ax, case in zip(flat, order):
         draw(ax, case, obs_key)
-    fig.suptitle(title, fontsize=13, y=0.995)
-    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    for ax in list(flat)[n:]:
+        ax.axis("off")
+    fig.suptitle(title, fontsize=14, y=0.997)
+    fig.tight_layout(rect=[0, 0, 1, 0.99])
     path = os.path.join(DIR, outfile)
-    fig.savefig(path, dpi=120)
+    fig.savefig(path, dpi=110)
     plt.close(fig)
-    print("wrote", path)
+    print("wrote", path, f"({n} cases)")
 
 
 make_figure("observed_composite",

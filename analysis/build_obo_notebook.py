@@ -1,8 +1,8 @@
 """Builds analysis/obo_envelope_explorer.ipynb from the exported off-by-one TSVs.
 
 Dependency-free authoring: constructs the notebook JSON with the stdlib `json` module (nbformat is
-not installed on this machine). The resulting notebook itself needs only numpy + matplotlib + stdlib
-csv to run (ipywidgets is used if present but is optional).
+not required for authoring). The notebook itself needs only numpy + matplotlib + stdlib csv to run;
+ipywidgets (installed in the repo .venv) powers the interactive dropdown when present.
 
 Run:  python analysis/build_obo_notebook.py
 """
@@ -34,8 +34,8 @@ cells = []
 
 cells.append(md(r"""# Off-by-one envelope explorer
 
-Interactively compare, for each monoisotope **off-by-one** miss, the real observed MS1 isotope
-envelope against the two competing interpretations:
+Explore **all ~47** monoisotope **off-by-one** misses of the untargeted detector. For each one,
+compare the real observed MS1 isotope envelope against the two competing interpretations:
 
 - **FlashLFQ (ref)** — averagine anchored at the MetaMorpheus/FlashLFQ monoisotopic mass (`k=0`).
 - **Pipeline** — averagine anchored where our untargeted detector placed the mono (`k = reported_k`).
@@ -43,26 +43,26 @@ envelope against the two competing interpretations:
 Whichever template hugs the gray observed centroids is where the monoisotope really is.
 
 **Data** comes from `obo_meta.tsv`, `obo_series.tsv`, `obo_scans.tsv` in this folder, written by
-`rust/flashlfq-core/examples/obo_envelope_probe.rs`:
+`rust/flashlfq-core/examples/obo_envelope_probe.rs`. To (re)generate for all 47 cases:
 
 ```
+python analysis/make_obo_targets.py                       # -> analysis/obo_targets.tsv (the 47)
 cargo build --release --example obo_envelope_probe
-EXPORT_DIR=analysis  ./target/release/examples/obo_envelope_probe   # (set env, then run the exe)
+# then, with env set:  EXPORT_DIR=analysis  OBO_TARGETS=analysis/obo_targets.tsv
+#   ./target/release/examples/obo_envelope_probe
+python analysis/build_obo_notebook.py                     # rebuild this notebook
 ```
 
-To explore **new** peptides, edit the `targets` array in that example and re-run with `EXPORT_DIR`.
-
-Needs only `numpy` + `matplotlib` + stdlib `csv`. `ipywidgets` is used for sliders if available.
+Use the **dropdown** near the bottom for interactive browsing, or `plot_case(order[i])` directly.
 """))
 
 cells.append(code(r"""
-import csv, os
+import csv, os, math
 from collections import defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
 
 DATA_DIR = os.path.dirname(os.path.abspath("__file__")) if "__file__" in globals() else os.getcwd()
-# When run from the repo root or the analysis dir, fall back to finding the TSVs next to this nb.
 for cand in (DATA_DIR, os.path.join(DATA_DIR, "analysis"), "."):
     if os.path.exists(os.path.join(cand, "obo_meta.tsv")):
         DATA_DIR = cand
@@ -89,7 +89,16 @@ with open(os.path.join(DATA_DIR, "obo_scans.tsv"), newline="") as f:
         scans[row["case"]][off].append((float(row["mz"]), float(row["intensity"])))
         scan_rt[row["case"]][off] = float(row["rt"])
 
-order
+print(len(order), "off-by-one cases loaded")
+"""))
+
+cells.append(md("## The cases\n\nFull list with charge, reference mass, and the direction the pipeline was off (`reported_k`):"))
+
+cells.append(code(r"""
+print(f"{'idx':>3}  {'case':34} {'z':>2} {'ref_mono':>10} {'reported_k':>10}")
+for i, c in enumerate(order):
+    m = meta[c]
+    print(f"{i:>3}  {c:34} {m['z']:>2} {m['ref_mono']:>10.3f} {m['reported_k']:>+10d}")
 """))
 
 cells.append(md(r"""## A self-contained averagine model
@@ -97,8 +106,8 @@ cells.append(md(r"""## A self-contained averagine model
 So you can overlay a template at **any** shift (not just the three the Rust probe exported), here is a
 small pure-Python averagine: pick the averagine composition for a target mass, then compute its
 isotope envelope by convolving the elemental isotope patterns. It reproduces the *shape* (and the
-mode-shift for heavy peptides) of the Rust `deconvolution::averagine_*` model; a validation cell below
-overlays it on the exported Rust templates so you can confirm."""))
+mode-shift for heavy peptides) of the Rust `deconvolution::averagine_*` model; the validation cell
+below overlays it on the exported Rust templates so you can confirm."""))
 
 cells.append(code(r"""
 PROTON = 1.007276466
@@ -145,7 +154,6 @@ def template(mono_mass, z, kshift=0, maxlen=14, min_w=1e-3):
     C13 = 1.0033548381
     anchor = mono_mass + kshift * C13
     w = averagine_weights(anchor, maxlen)
-    # drop the descending tail below min_w (keep through the mode)
     mode = int(np.argmax(w))
     end = len(w)
     while end > mode + 1 and w[end-1] < min_w:
@@ -158,27 +166,30 @@ print("averagine residue mass ~ %.3f Da/multiplier" % _RES_MASS)
 """))
 
 cells.append(code(r"""
-# Validation: our Python averagine vs the exact Rust templates the probe exported (should match shape).
-fig, axes = plt.subplots(1, len(order), figsize=(4*len(order), 3.2))
-for ax, case in zip(np.atleast_1d(axes), order):
+# Validation: Python averagine vs the exact Rust templates the probe exported (first few cases).
+show = order[:4]
+fig, axes = plt.subplots(1, len(show), figsize=(4*len(show), 3.2))
+for ax, case in zip(np.atleast_1d(axes), show):
     m = meta[case]
     rust = sorted(series[case]["avg_mono"])
     py = template(m["ref_mono"], m["z"], 0)
     ax.plot([p[0] for p in rust], [p[1] for p in rust], "o-", label="Rust", alpha=.7)
     ax.plot([p[0] for p in py], [p[1] for p in py], "x--", label="Python", alpha=.7)
-    ax.set_title(case, fontsize=8); ax.legend(fontsize=7)
+    ax.set_title(case, fontsize=7); ax.legend(fontsize=7)
 fig.suptitle("Averagine template: Rust (exact) vs Python (this notebook)"); fig.tight_layout()
 """))
 
-cells.append(md(r"""## Per-case: observed envelope vs FlashLFQ vs pipeline
+cells.append(md(r"""## Plotting functions
 
-`plot_case(case, observed='observed_composite', extra_shifts=())` — set `observed` to
-`'observed_apex'` for the single apex scan, or pass `extra_shifts=[+2, -2]` to overlay more anchors."""))
+- `plot_case(case, observed='observed_composite', extra_shifts=(), legend=True, ax=None)` — observed
+  envelope vs FlashLFQ-ref (green) and pipeline (pink); pass `observed='observed_apex'` for the apex
+  scan, or `extra_shifts=[+2, -2]` to overlay more anchors.
+- `plot_elution(case)` — every scan in the apex ±3 window as small multiples."""))
 
 cells.append(code(r"""
 REF_C, PIPE_C, OBS_C = "#2ca02c", "#c2185b", "0.55"
 
-def plot_case(case, observed="observed_composite", extra_shifts=(), ax=None):
+def plot_case(case, observed="observed_composite", extra_shifts=(), legend=True, ax=None):
     m = meta[case]; z, sp, mono_mz, rk = m["z"], m["spacing"], m["mono_mz"], m["reported_k"]
     if ax is None:
         _, ax = plt.subplots(figsize=(9, 5))
@@ -187,95 +198,93 @@ def plot_case(case, observed="observed_composite", extra_shifts=(), ax=None):
     omax = max((i for _, i in obs), default=1.0) or 1.0
     for mz, i in obs:
         ax.vlines(mz, 0, i/omax, color=OBS_C, lw=3, zorder=1)
-    ax.vlines([], [], [], color=OBS_C, lw=3, label="observed centroids")
+    ax.vlines([], [], [], color=OBS_C, lw=3, label="observed")
 
-    curves = [(0, REF_C, "o", "FlashLFQ (ref) mono"),
-              (rk, PIPE_C, "X", f"pipeline mono (k={rk:+d})")]
+    curves = [(0, REF_C, "o", "FlashLFQ (ref)"),
+              (rk, PIPE_C, "X", f"pipeline (k={rk:+d})")]
     for k in extra_shifts:
         curves.append((k, None, ".", f"k={k:+d}"))
     for k, color, marker, name in curves:
-        pts = template(m["ref_mono"], z, k)
-        pts = [(mz, w) for mz, w in pts if xmin-sp <= mz <= xmax+sp]
-        ax.plot([p[0] for p in pts], [p[1] for p in pts], "-", marker=marker, ms=7, lw=1.7,
+        pts = [(mz, w) for mz, w in template(m["ref_mono"], z, k) if xmin-sp <= mz <= xmax+sp]
+        ax.plot([p[0] for p in pts], [p[1] for p in pts], "-", marker=marker, ms=6, lw=1.6,
                 alpha=.9, color=color, label=name, zorder=3)
-    ax.axvline(mono_mz, color=REF_C, ls="--", lw=1.1, alpha=.8)
-    ax.axvline(mono_mz + rk*sp, color=PIPE_C, ls=":", lw=1.4, alpha=.9)
+    ax.axvline(mono_mz, color=REF_C, ls="--", lw=1.0, alpha=.8)
+    ax.axvline(mono_mz + rk*sp, color=PIPE_C, ls=":", lw=1.3, alpha=.9)
     ax.set_xlim(xmin, xmax); ax.set_ylim(0, 1.22)
-    ax.set_title(f"{case}  z{z}  ref_mono {m['ref_mono']:.3f} Da  (pipeline off by {rk:+d} 13C)", fontsize=10)
-    ax.set_xlabel("m/z"); ax.set_ylabel("rel. intensity")
-    ax.legend(fontsize=8, loc="upper right"); ax.grid(True, alpha=.15)
+    ax.set_title(f"{case}\nz{z}  {m['ref_mono']:.3f} Da  (off by {rk:+d} 13C)", fontsize=8)
+    ax.set_xlabel("m/z", fontsize=8); ax.set_ylabel("rel. int", fontsize=8)
+    if legend:
+        ax.legend(fontsize=7, loc="upper right")
+    ax.grid(True, alpha=.15)
     return ax
 
-fig, axes = plt.subplots(2, 2, figsize=(15, 9))
-for ax, case in zip(axes.flat, order):
-    plot_case(case, "observed_composite", ax=ax)
-fig.suptitle("Averaged composite", y=.995); fig.tight_layout()
-"""))
-
-cells.append(md("Same four, but the **single apex scan** instead of the averaged composite:"))
-
-cells.append(code(r"""
-fig, axes = plt.subplots(2, 2, figsize=(15, 9))
-for ax, case in zip(axes.flat, order):
-    plot_case(case, "observed_apex", ax=ax)
-fig.suptitle("Apex scan", y=.995); fig.tight_layout()
-"""))
-
-cells.append(md(r"""## Elution explorer
-
-`plot_elution(case)` shows every scan in the apex +-3 window as a small multiple, so you can see how
-the envelope (and which peaks are present) changes across the peak. Watch the monoisotope peak appear
-and disappear -- that per-scan instability is part of why the off-by-one happens."""))
-
-cells.append(code(r"""
 def plot_elution(case):
     m = meta[case]; z, sp, mono_mz, rk = m["z"], m["spacing"], m["mono_mz"], m["reported_k"]
-    offs = sorted(scans[case])
-    n = len(offs)
-    fig, axes = plt.subplots(1, n, figsize=(3.1*n, 3.4), sharey=True)
+    offs = sorted(scans[case]); n = len(offs)
+    fig, axes = plt.subplots(1, n, figsize=(3.0*n, 3.2), sharey=True)
     xmin, xmax = mono_mz - 1.6*sp, mono_mz + 9*sp
     for ax, off in zip(np.atleast_1d(axes), offs):
         pts = [(mz, i) for mz, i in scans[case][off] if xmin <= mz <= xmax]
         omax = max((i for _, i in pts), default=1.0) or 1.0
         for mz, i in pts:
-            ax.vlines(mz, 0, i/omax, color=OBS_C, lw=2.6)
-        ax.axvline(mono_mz, color=REF_C, ls="--", lw=1.1)
-        ax.axvline(mono_mz + rk*sp, color=PIPE_C, ls=":", lw=1.3)
+            ax.vlines(mz, 0, i/omax, color=OBS_C, lw=2.4)
+        ax.axvline(mono_mz, color=REF_C, ls="--", lw=1.0)
+        ax.axvline(mono_mz + rk*sp, color=PIPE_C, ls=":", lw=1.2)
         ax.set_xlim(xmin, xmax); ax.set_ylim(0, 1.15)
         tag = "APEX" if off == 0 else f"apex{off:+d}"
         ax.set_title(f"{tag}\nRT {scan_rt[case][off]:.3f}", fontsize=8)
-        ax.set_xlabel("m/z")
-    axes[0].set_ylabel("rel. intensity")
-    fig.suptitle(f"{case}  z{z}  — green=FlashLFQ mono, pink=pipeline mono", y=1.02)
+        ax.set_xlabel("m/z", fontsize=8)
+    np.atleast_1d(axes)[0].set_ylabel("rel. int")
+    fig.suptitle(f"{case}  z{z}  — green=FlashLFQ mono, pink=pipeline mono", y=1.03, fontsize=10)
     fig.tight_layout()
 
-plot_elution("AVVQDPALKP(z3)")
+# Quick look at the first case:
+plot_case(order[0]);
 """))
 
-cells.append(md("## Free exploration\n\nPick a case and overlay whatever shifts you like:"))
+cells.append(md(r"""## Interactive explorer
+
+Pick any case from the dropdown. Shows the composite + apex + full elution. (Needs ipywidgets — the
+repo `.venv` has it. If it is missing, use `plot_case(order[i])` / `plot_elution(order[i])` manually.)"""))
 
 cells.append(code(r"""
-# Try an arbitrary set of shifts on any case:
-plot_case("AVVQDPALKP(z3)", "observed_composite", extra_shifts=[-2, +1]);
-"""))
-
-cells.append(code(r"""
-# Optional slider (only if ipywidgets is installed):
 try:
-    from ipywidgets import interact, Dropdown, SelectMultiple
-    def _explore(case, observed):
-        plot_case(case, observed); plt.show()
-    interact(_explore,
-             case=Dropdown(options=order, value=order[0]),
-             observed=Dropdown(options=["observed_composite", "observed_apex"]))
+    from ipywidgets import interact, Dropdown
+    def _explore(case):
+        fig, ax = plt.subplots(1, 2, figsize=(15, 4.6))
+        plot_case(case, "observed_composite", ax=ax[0]); ax[0].set_title("composite\n" + ax[0].get_title(), fontsize=8)
+        plot_case(case, "observed_apex", ax=ax[1]);      ax[1].set_title("apex scan\n" + ax[1].get_title(), fontsize=8)
+        fig.tight_layout(); plt.show()
+        plot_elution(case); plt.show()
+    interact(_explore, case=Dropdown(options=order, value=order[0], description="case"))
 except Exception as e:
-    print("ipywidgets not available (%s) -- edit the cells above to explore manually." % e)
+    print("ipywidgets not available (%s) — use plot_case(order[i]) manually." % e)
+"""))
+
+cells.append(md("## Overview grid — every case at a glance (averaged composite)"))
+
+cells.append(code(r"""
+n = len(order); ncols = 4; nrows = math.ceil(n / ncols)
+fig, axes = plt.subplots(nrows, ncols, figsize=(4.4*ncols, 2.9*nrows))
+for ax, case in zip(axes.flat, order):
+    plot_case(case, "observed_composite", legend=False, ax=ax)
+for ax in axes.flat[n:]:
+    ax.axis("off")
+fig.tight_layout()
+"""))
+
+cells.append(md("## Free exploration\n\nOverlay whatever shifts you like, on any case index:"))
+
+cells.append(code(r"""
+i = 0                       # <- change the index
+plot_case(order[i], "observed_composite", extra_shifts=[-2, +1]);
+plot_elution(order[i]);
 """))
 
 nb = {
     "cells": cells,
     "metadata": {
-        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "kernelspec": {"display_name": "flashlfq (.venv)", "language": "python", "name": "flashlfq"},
         "language_info": {"name": "python", "version": "3"},
     },
     "nbformat": 4,
