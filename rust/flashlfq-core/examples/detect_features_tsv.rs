@@ -9,18 +9,19 @@
 //! Usage:
 //!   cargo run --release --example detect_features_tsv -- <spectra_file> <out.tsv> [reference.tsv]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 use flashlfq_core::deconvolution::{ClassicDeconvolutionParameters, Polarity};
 use flashlfq_core::feature_refinement::{
-    four_way_decon, refine_feature, resolve_charge_state_consensus, DeconView, FourWayDecon,
-    RefinedFeature, ResolvedFeature,
+    four_way_decon, four_way_decon_detector_anchor, four_way_decon_gated, refine_feature,
+    refine_feature_censored, refine_feature_shift, resolve_charge_state_consensus, DeconView,
+    FourWayDecon, NeighborIndex, RefinedFeature, ResolvedFeature,
 };
-use flashlfq_core::isotopic_envelope::mass_to_mz_f64;
-use flashlfq_core::peak_indexing::{read_ms1_scans, PeakIndexingEngine};
+use flashlfq_core::isotopic_envelope::{mass_to_mz_f64, C13_MINUS_C12};
+use flashlfq_core::peak_indexing::{read_ms1_scans, PeakIndexingEngine, PeakKey};
 use flashlfq_core::trace_kernel::{
     detect_features, estimate_noise_floor, median_ms1_scan_spacing_minutes, CombWeightModel,
     DetectedFeature, ScoreModel, TraceKernelParameters, FWHM_TO_SIGMA,
@@ -243,11 +244,45 @@ fn main() {
         3.0,
         Polarity::Positive,
     );
+    // CENSOR_CLAIMED=1 removes peaks claimed by OTHER (stronger, already-assigned) features from
+    // each feature's composite before deconvolution — a subtractive-decon experiment. Since the
+    // detector claims greedily tallest-first, this hands weaker features a window with co-eluting
+    // interferents removed.
+    let censor_claimed = std::env::var("CENSOR_CLAIMED").is_ok();
+    let all_claimed: HashSet<PeakKey> = if censor_claimed {
+        detected
+            .iter()
+            .flat_map(|f| f.peaks.iter().map(|p| p.key()))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    if censor_claimed {
+        eprintln!(
+            "  CENSOR_CLAIMED: subtracting {} claimed peaks from other features' decon windows",
+            all_claimed.len()
+        );
+    }
+
+    // REFINE_METHOD selects the deconvolution used to place the refined monoisotope:
+    //   classic (default) | shift_composite | shift_apex  (detector-anchored FlashLFQ-style shift).
+    let refine_method = std::env::var("REFINE_METHOD").unwrap_or_else(|_| "classic".to_string());
+    let use_shift_apex = refine_method == "shift_apex";
+    let use_shift = use_shift_apex || refine_method == "shift_composite";
+    eprintln!("  refine method: {refine_method}");
+
     let t2 = Instant::now();
     let mut refined: Vec<RefinedFeature> = Vec::with_capacity(detected.len());
     let progress_every = 1000usize;
     for (i, f) in detected.iter().enumerate() {
-        if let Some(r) = refine_feature(f, &scans, &avg, &decon) {
+        let r = if use_shift {
+            refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex)
+        } else if censor_claimed {
+            refine_feature_censored(f, &scans, &avg, &decon, &all_claimed)
+        } else {
+            refine_feature(f, &scans, &avg, &decon)
+        };
+        if let Some(r) = r {
             refined.push(r);
         }
         if (i + 1) % progress_every == 0 || i + 1 == detected.len() {
@@ -366,17 +401,106 @@ fn run_four_way(
         .unwrap();
     }
 
+    // Full per-feature verdict table: each view's monoisotopic mass (blank if the view produced
+    // nothing). Lets the within-method (composite-vs-apex) and ground-truth analysis run in Python.
+    let vpath = path.replace(".disagreements.tsv", ".verdicts.tsv");
+    let mut vw = open_out(&vpath);
+    if let Some(vw) = vw.as_mut() {
+        writeln!(vw, "Detector Mono\tCharge\tApex RT\tcc_mono\tca_mono\tsc_mono\tsa_mono").unwrap();
+    }
+    let mono_of = |fw: &FourWayDecon, view: DeconView| -> Option<f64> {
+        fw.verdicts
+            .iter()
+            .find(|v| v.view == view)
+            .map(|v| v.monoisotopic_mass)
+    };
+    let fmt = |m: Option<f64>| m.map(|x| format!("{x:.5}")).unwrap_or_default();
+    // Within-method composite-vs-apex agreement (same integer ¹³C offset), counted where both views exist.
+    let mut classic_agree = 0usize;
+    let mut classic_disagree = 0usize;
+    let mut shift_agree = 0usize;
+    let mut shift_disagree = 0usize;
+    let same_k = |a: f64, b: f64| ((a - b) / C13_MINUS_C12).round() == 0.0;
+
+    // NEIGHBOR_AWARE=1 gates the shift-decon anchor: peaks belonging to a co-eluting already-detected
+    // feature (its predicted isotope grid) are excluded as anchor candidates, so shift-decon can't
+    // "distant grab" a stronger neighbour several isotopes away. Builds an RT-bucketed neighbour index.
+    // DETECTOR_ANCHOR=1 takes precedence: anchor the shift views on the detector's own most-abundant
+    // claimed peak (cannot grab any foreign peak). NEIGHBOR_AWARE=1 gates against co-eluting neighbours.
+    let detector_anchor = std::env::var("DETECTOR_ANCHOR").is_ok();
+    let neighbor_aware = !detector_anchor && std::env::var("NEIGHBOR_AWARE").is_ok();
+    let neighbors = if neighbor_aware {
+        eprintln!("  NEIGHBOR_AWARE: gating shift anchors against co-eluting detected features");
+        Some(NeighborIndex::build(detected, 0.05))
+    } else {
+        None
+    };
+    if detector_anchor {
+        eprintln!("  DETECTOR_ANCHOR: shift views anchor on the detector's most-abundant claimed peak");
+    }
+    const GRID_PPM: f64 = 15.0;
+
     let mut total = 0usize; // features that produced >=1 verdict
     let mut with_verdicts_hist = [0usize; 5]; // count by number of verdicts (0..=4)
     let mut unanimous = 0usize;
     let mut disagreed = 0usize;
-    for f in detected {
-        let fw: FourWayDecon = four_way_decon(f, scans, avg, decon, 20.0);
+    for (i, f) in detected.iter().enumerate() {
+        let fw: FourWayDecon = if detector_anchor {
+            four_way_decon_detector_anchor(f, scans, avg, decon, 20.0)
+        } else {
+            match &neighbors {
+                Some(idx) => {
+                    // Same shift window the comparator uses, to gather the neighbours' forbidden teeth.
+                    let spacing = C13_MINUS_C12 / f.charge.max(1) as f64;
+                    let win_min = (f.mono_mz - 1.5).max(0.0);
+                    let win_max = f.mono_mz + (f.num_isotopes_observed as f64 + 3.0) * spacing + 1.0;
+                    let forbidden = idx.forbidden_positions(i, win_min, win_max);
+                    four_way_decon_gated(f, scans, avg, decon, 20.0, &forbidden, GRID_PPM)
+                }
+                None => four_way_decon(f, scans, avg, decon, 20.0),
+            }
+        };
         with_verdicts_hist[fw.verdicts.len().min(4)] += 1;
         if fw.verdicts.is_empty() {
             continue;
         }
         total += 1;
+
+        // Per-feature verdict row + within-method (composite vs apex) agreement.
+        let (cc, ca, sc, sa) = (
+            mono_of(&fw, DeconView::ClassicComposite),
+            mono_of(&fw, DeconView::ClassicApex),
+            mono_of(&fw, DeconView::ShiftComposite),
+            mono_of(&fw, DeconView::ShiftApex),
+        );
+        if let Some(vw) = vw.as_mut() {
+            writeln!(
+                vw,
+                "{:.5}\t{}\t{:.4}\t{}\t{}\t{}\t{}",
+                fw.detector_mono,
+                fw.charge,
+                f.apex_rt,
+                fmt(cc),
+                fmt(ca),
+                fmt(sc),
+                fmt(sa)
+            )
+            .unwrap();
+        }
+        if let (Some(a), Some(b)) = (cc, ca) {
+            if same_k(a, b) {
+                classic_agree += 1;
+            } else {
+                classic_disagree += 1;
+            }
+        }
+        if let (Some(a), Some(b)) = (sc, sa) {
+            if same_k(a, b) {
+                shift_agree += 1;
+            } else {
+                shift_disagree += 1;
+            }
+        }
         if fw.needs_advanced {
             disagreed += 1;
             if let Some(w) = w.as_mut() {
@@ -404,6 +528,22 @@ fn run_four_way(
     if let Some(mut w) = w {
         let _ = w.flush();
     }
+    if let Some(mut vw) = vw {
+        let _ = vw.flush();
+        eprintln!("  wrote per-feature verdicts -> {vpath}");
+    }
+
+    let cpair = classic_agree + classic_disagree;
+    let spair = shift_agree + shift_disagree;
+    eprintln!("\n=== within-method composite-vs-apex agreement ===");
+    eprintln!(
+        "  classic (cc vs ca): {} agree / {} disagree  ({:.1}% agree of {} with both)",
+        classic_agree, classic_disagree, 100.0 * classic_agree as f64 / cpair.max(1) as f64, cpair
+    );
+    eprintln!(
+        "  shift   (sc vs sa): {} agree / {} disagree  ({:.1}% agree of {} with both)",
+        shift_agree, shift_disagree, 100.0 * shift_agree as f64 / spair.max(1) as f64, spair
+    );
 
     eprintln!("\n=== four-way decon comparator ===");
     eprintln!("  detected features: {}", detected.len());

@@ -240,6 +240,80 @@ pub fn shift_decon_in_window(
     shift_decon(mz, intensity, mz[anchor_idx], charge, tol_ppm)
 }
 
+/// Whether `mz` is within `ppm` of any position in the ascending `sorted` list.
+fn near_any(mz: f64, sorted: &[f64], ppm: f64) -> bool {
+    if sorted.is_empty() {
+        return false;
+    }
+    let ip = sorted.partition_point(|&m| m < mz);
+    for cand in [ip.checked_sub(1), Some(ip)].into_iter().flatten() {
+        if let Some(&f) = sorted.get(cand) {
+            if (mz - f).abs() / mz * 1e6 <= ppm {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// **Neighbor-aware** variant of [`shift_decon_in_window`]: the anchor (most-abundant) peak is the
+/// tallest peak in the window that is *eligible*, where a peak is eligible unless it belongs to an
+/// already-detected neighbouring feature. A peak is **excluded** when it lies within `grid_ppm` of a
+/// `forbidden_mz` position (a neighbour's predicted isotope m/z) AND is **not** on this feature's own
+/// isotope grid (`own_mono_mz + k·spacing`, `k ∈ [0, own_kmax]`). Own-grid peaks are always eligible,
+/// so a co-eluting duplicate detection cannot exclude this feature's real teeth.
+///
+/// This directly fixes the "distant grab": the tallest peak in a wide window is often a stronger
+/// co-eluting *different* species several isotopes away; anchoring there places the monoisotope on
+/// the neighbour. Excluding the neighbour's grid positions makes the shift decon anchor on this
+/// feature's own strongest peak instead. `forbidden_mz` must be ascending.
+#[allow(clippy::too_many_arguments)]
+pub fn shift_decon_gated(
+    mz: &[f64],
+    intensity: &[f64],
+    window_min_mz: f64,
+    window_max_mz: f64,
+    charge: i32,
+    tol_ppm: f64,
+    own_mono_mz: f64,
+    own_kmax: usize,
+    forbidden_mz: &[f64],
+    grid_ppm: f64,
+) -> Option<ShiftDeconResult> {
+    assert_eq!(mz.len(), intensity.len(), "mz and intensity must be parallel");
+    if charge == 0 {
+        return None;
+    }
+    let spacing = C13_MINUS_C12 / charge.abs() as f64;
+    let lo = mz.partition_point(|&m| m < window_min_mz);
+    let hi = mz.partition_point(|&m| m <= window_max_mz);
+
+    let on_own_grid = |m: f64| -> bool {
+        let k = ((m - own_mono_mz) / spacing).round();
+        if k < 0.0 || k > own_kmax as f64 {
+            return false;
+        }
+        let expected = own_mono_mz + k * spacing;
+        (m - expected).abs() / expected * 1e6 <= grid_ppm
+    };
+
+    let mut anchor_idx: Option<usize> = None;
+    let mut anchor_int = f64::NEG_INFINITY;
+    for i in lo..hi {
+        let m = mz[i];
+        // Excluded iff attributed to a neighbour and not one of our own teeth.
+        if !on_own_grid(m) && near_any(m, forbidden_mz, grid_ppm) {
+            continue;
+        }
+        if intensity[i] > anchor_int {
+            anchor_int = intensity[i];
+            anchor_idx = Some(i);
+        }
+    }
+    let ai = anchor_idx?;
+    shift_decon(mz, intensity, mz[ai], charge, tol_ppm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +363,54 @@ mod tests {
             mono,
             ppm_diff(r.monoisotopic_mass, mono)
         );
+    }
+
+    #[test]
+    fn gated_anchor_ignores_taller_off_grid_neighbor() {
+        // Reproduce the drift0 mechanism: a target envelope plus a TALLER, unrelated species ~4
+        // isotopes above, off the target's grid. Ungated shift-decon grabs the neighbour → drifts;
+        // the gated variant, told the neighbour's grid m/z, anchors on the target instead.
+        let charge = 1;
+        let target_mono = 980.0;
+        let (mut mz, mut inten, target_anchor) = synthetic_envelope(target_mono, charge);
+        let target_mono_mz = mass_to_mz_f64(target_mono, charge);
+        let spacing = C13_MINUS_C12 / charge as f64;
+
+        // Foreign species ~4 isotopes up (off the integer grid so it's clearly a different peptide),
+        // ~1.5× the target's tallest intensity. Add its envelope teeth.
+        let target_max = inten.iter().copied().fold(0.0_f64, f64::max);
+        let foreign_mono_mz = target_mono_mz + 3.94 * spacing;
+        let mut foreign_grid: Vec<f64> = Vec::new();
+        for (k, w) in [1.0, 0.55, 0.2].into_iter().enumerate() {
+            let m = foreign_mono_mz + k as f64 * spacing;
+            mz.push(m);
+            inten.push(target_max * 1.5 * w);
+            foreign_grid.push(m);
+        }
+        // Re-sort ascending (parallel).
+        let mut pairs: Vec<(f64, f64)> = mz.iter().copied().zip(inten.iter().copied()).collect();
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mz: Vec<f64> = pairs.iter().map(|p| p.0).collect();
+        let inten: Vec<f64> = pairs.iter().map(|p| p.1).collect();
+        foreign_grid.sort_by(f64::total_cmp);
+
+        let win_lo = target_mono_mz - 1.5;
+        let win_hi = target_mono_mz + 8.0 * spacing;
+
+        // Ungated: grabs the taller foreign peak → mono drifts up by ~4 isotopes.
+        let ungated = shift_decon_in_window(&mz, &inten, win_lo, win_hi, charge, 15.0).unwrap();
+        let k_ungated = ((ungated.monoisotopic_mass - target_mono) / C13_MINUS_C12).round() as i32;
+        assert!(k_ungated >= 3, "ungated should drift onto the neighbour (k={k_ungated})");
+
+        // Gated with the neighbour's grid forbidden: anchors on the target → k=0.
+        let gated = shift_decon_gated(
+            &mz, &inten, win_lo, win_hi, charge, 15.0, target_mono_mz, 6, &foreign_grid, 15.0,
+        )
+        .unwrap();
+        let k_gated = ((gated.monoisotopic_mass - target_mono) / C13_MINUS_C12).round() as i32;
+        assert_eq!(k_gated, 0, "gated should recover the target mono (k={k_gated})");
+        // Sanity: the gated anchor is the target's own most-abundant peak.
+        assert!(ppm_diff(gated.most_intense_mass, mz_to_mass(target_anchor, charge)) < 5.0);
     }
 
     #[test]

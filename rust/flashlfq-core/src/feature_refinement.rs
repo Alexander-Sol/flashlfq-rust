@@ -36,22 +36,22 @@
 //!   charges" is softened to "the max-support cluster" (design's "≥2 charges, weighted by support").
 
 use crate::deconvolution::{classic_deconvolute, ClassicDeconvolutionParameters};
-use crate::isotope_shift_decon::shift_decon_in_window;
+use crate::isotope_shift_decon::{shift_decon, shift_decon_gated, shift_decon_in_window};
 use crate::isotopic_envelope::{mass_to_mz_f64, C13_MINUS_C12};
-use crate::peak_indexing::Scan;
+use crate::peak_indexing::{PeakKey, Scan};
 use crate::spectral_averaging::{average_spectra, SpectralAveragingParameters};
 use crate::trace_kernel::DetectedFeature;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Absolute mass-clustering floor (Da) for small masses, where a ppm window would be tighter than
 /// real mass precision. Applied as `max(mass · ppm/1e6, MASS_CLUSTER_ABS_FLOOR_DA)`.
 pub const MASS_CLUSTER_ABS_FLOOR_DA: f64 = 0.01;
 
 /// Hard cap on how many MS1 scans [`refine_feature`] averages into the composite. The composite is a
-/// high-SNR snapshot at the feature apex, so this stays small (≈ SpectralAveraging's default of 5);
-/// averaging more pulls in co-eluting interference. A `> MAX_SCANS_TO_AVERAGE` window is treated as
-/// a bug (asserted), not silently accepted.
-pub const MAX_SCANS_TO_AVERAGE: usize = 7;
+/// high-SNR snapshot at the feature apex, so this stays small — just the apex plus one scan on either
+/// side; averaging more pulls in co-eluting interference. A `> MAX_SCANS_TO_AVERAGE` window is treated
+/// as a bug (asserted), not silently accepted.
+pub const MAX_SCANS_TO_AVERAGE: usize = 3;
 
 /// Largest integer ¹³C off-by-one offset tolerated when grouping features by neutral mass. The mono
 /// off-by-one is normally ±1; ±2 is allowed for robustness against a doubly-mis-assigned monoisotope.
@@ -109,11 +109,100 @@ pub struct ResolvedFeature {
 ///
 /// Returns `None` when the window is empty, the composite is empty, or no composite envelope matches
 /// the detected charge state.
+/// Refines a feature using the **detector-anchored shift decon** instead of classic deconvolution:
+/// anchors on the detector's own most-abundant claimed peak, then runs the FlashLFQ-style −1/0/+1
+/// placement. `use_apex` selects the single apex scan (more accurate vs FlashLFQ truth in testing)
+/// over the averaged composite. Returns `None` on the same degenerate conditions as [`refine_feature`],
+/// or when the shift decon finds no envelope.
+///
+/// The resulting [`RefinedFeature`] carries a single candidate mass (the shift mono); the cross-charge
+/// consensus still clusters those across charges. Experiment path (pipeline `REFINE_METHOD`).
+pub fn refine_feature_shift(
+    feature: &DetectedFeature,
+    scans: &[Scan],
+    averaging_params: &SpectralAveragingParameters,
+    shift_tol_ppm: f64,
+    use_apex: bool,
+) -> Option<RefinedFeature> {
+    let s = build_feature_slices(feature, scans, averaging_params)?;
+    // Detector's own most-abundant claimed peak — the anchor that cannot grab a foreign peak.
+    let anchor_mz = feature
+        .peaks
+        .iter()
+        .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
+        .map(|p| p.m() as f64)?;
+    let (mz, inten) = if use_apex {
+        (&s.apex_mz, &s.apex_int)
+    } else {
+        (&s.comp_mz, &s.comp_int)
+    };
+    let r = shift_decon(mz, inten, anchor_mz, feature.charge, shift_tol_ppm)?;
+    Some(RefinedFeature {
+        detected: feature.clone(),
+        refined_monoisotopic_mass: r.monoisotopic_mass,
+        refined_charge: feature.charge,
+        candidate_masses: vec![r.monoisotopic_mass],
+        decon_score: r.shift_correlations[1],
+    })
+}
+
+/// Whether `mz` falls on this feature's isotope grid — within [`GRID_PPM`] of `mono_mz + k·spacing`
+/// for some isotope index `k ∈ [-1, num_isotopes_observed + 2]`. Grid-gated censoring keeps on-grid
+/// peaks (this feature's own envelope teeth, whoever claimed them) and only removes off-grid claimed
+/// interferents.
+fn on_isotope_grid(mz: f64, feature: &DetectedFeature, spacing: f64) -> bool {
+    /// ppm window for treating an observed peak as one of the feature's expected isotope teeth.
+    const GRID_PPM: f64 = 15.0;
+    if spacing <= 0.0 {
+        return false;
+    }
+    let k = ((mz - feature.mono_mz) / spacing).round();
+    let kmax = feature.num_isotopes_observed as f64 + 2.0;
+    if k < -1.0 || k > kmax {
+        return false;
+    }
+    let expected = feature.mono_mz + k * spacing;
+    (mz - expected).abs() / expected * 1e6 <= GRID_PPM
+}
+
 pub fn refine_feature(
     feature: &DetectedFeature,
     scans: &[Scan],
     averaging_params: &SpectralAveragingParameters,
     decon_params: &ClassicDeconvolutionParameters,
+) -> Option<RefinedFeature> {
+    refine_feature_inner(feature, scans, averaging_params, decon_params, None)
+}
+
+/// [`refine_feature`] with **subtractive peak censoring**: peaks claimed by *other* features are
+/// removed from this feature's composite before deconvolution.
+///
+/// `all_claimed` is the union of every detected feature's claimed-peak keys (from
+/// [`DetectedFeature::peaks`]). Because the trace-kernel detector claims greedily tallest-first,
+/// every peak is owned by exactly one feature; when refining feature X we drop any window peak that
+/// is claimed but not owned by X — i.e. the peaks that stronger, already-assigned features took.
+/// This gives the deconvolution a cleaner window (co-eluting interferents removed) so it cannot
+/// anchor an envelope on a neighbouring species' peak. This feature's *own* claimed peaks and any
+/// **unclaimed** peaks (noise / not-yet-explained signal) are kept.
+///
+/// This is an experiment path (see the pipeline's `CENSOR_CLAIMED` flag); the uncensored
+/// [`refine_feature`] remains the default.
+pub fn refine_feature_censored(
+    feature: &DetectedFeature,
+    scans: &[Scan],
+    averaging_params: &SpectralAveragingParameters,
+    decon_params: &ClassicDeconvolutionParameters,
+    all_claimed: &HashSet<PeakKey>,
+) -> Option<RefinedFeature> {
+    refine_feature_inner(feature, scans, averaging_params, decon_params, Some(all_claimed))
+}
+
+fn refine_feature_inner(
+    feature: &DetectedFeature,
+    scans: &[Scan],
+    averaging_params: &SpectralAveragingParameters,
+    decon_params: &ClassicDeconvolutionParameters,
+    censor: Option<&HashSet<PeakKey>>,
 ) -> Option<RefinedFeature> {
     if scans.is_empty() || feature.peaks.is_empty() {
         return None;
@@ -125,7 +214,7 @@ pub fn refine_feature(
     // default is 5 scans). We deliberately do NOT use the feature's full claimed-peak scan extent:
     // the detector's RT window is ~±2σ, which in dense MS1 regions is ~100 scans.
     let apex = feature.apex_scan_index;
-    let half = (MAX_SCANS_TO_AVERAGE / 2) as i32; // 3 → up to 7 scans
+    let half = (MAX_SCANS_TO_AVERAGE / 2) as i32; // 1 → up to 3 scans (apex ± 1)
     let lo = (apex - half).max(0) as usize;
     let hi = ((apex + half).max(0) as usize).min(scans.len() - 1);
     if lo > hi {
@@ -158,11 +247,42 @@ pub fn refine_feature(
     let window = &scans[lo..=hi];
     let mut x_arrays: Vec<Vec<f64>> = Vec::with_capacity(window.len());
     let mut y_arrays: Vec<Vec<f64>> = Vec::with_capacity(window.len());
-    for s in window {
+    for (wi, s) in window.iter().enumerate() {
         let a = s.mz.partition_point(|&m| m < slice_lo);
         let b = s.mz.partition_point(|&m| m <= slice_hi);
-        x_arrays.push(s.mz[a..b].to_vec());
-        y_arrays.push(s.intensity[a..b].to_vec());
+        match censor {
+            None => {
+                x_arrays.push(s.mz[a..b].to_vec());
+                y_arrays.push(s.intensity[a..b].to_vec());
+            }
+            Some(claimed) => {
+                // Absolute scan index == position in `scans` == the peaks' zero_based_scan_index.
+                let abs = (lo + wi) as i32;
+                let mut mzv = Vec::with_capacity(b - a);
+                let mut inv = Vec::with_capacity(b - a);
+                for j in a..b {
+                    // Reproduce the indexed peak's f32-narrowed key (index_peaks built keys from the
+                    // same raw scans via `mz as f32` / `intensity as f32`).
+                    let key: PeakKey = (
+                        abs,
+                        (s.mz[j] as f32).to_bits(),
+                        (s.intensity[j] as f32).to_bits(),
+                    );
+                    // Grid-gated censoring: drop a peak only if another feature claimed it AND it is
+                    // NOT on this feature's own isotope grid. This removes off-grid interferents
+                    // (the peaks a competing envelope could anchor on) while preserving every tooth
+                    // of this feature's envelope — even isotopes a marginally-taller neighbour
+                    // claimed first — so a noisy claim partition can no longer delete real signal.
+                    if claimed.contains(&key) && !on_isotope_grid(s.mz[j], feature, spacing) {
+                        continue;
+                    }
+                    mzv.push(s.mz[j]);
+                    inv.push(s.intensity[j]);
+                }
+                x_arrays.push(mzv);
+                y_arrays.push(inv);
+            }
+        }
     }
     if x_arrays.iter().all(|x| x.is_empty()) {
         return None;
@@ -208,7 +328,7 @@ pub fn refine_feature(
 //
 // Runs two deconvolution *strategies* — the parity-gated classic `classic_deconvolute` and the
 // untargeted FlashLFQ-style [`crate::isotope_shift_decon`] — over two *spectrum views* — the
-// averaged apex±3 composite and the single apex scan — giving up to **four** monoisotope verdicts
+// averaged apex±1 composite and the single apex scan — giving up to **four** monoisotope verdicts
 // for one detected feature. When the four agree (same integer ¹³C offset) the placement is
 // confident; when they disagree the feature is flagged for a more advanced multi-envelope decon
 // (the disagreement is the signal that a single averagine envelope does not explain the window —
@@ -217,10 +337,82 @@ pub fn refine_feature(
 // deliberately triggers on **disagreement only**; unanimous-but-wrong is left to the downstream
 // cross-charge consensus, which is the correct backstop for the heavy-peptide case.
 
+/// An RT-bucketed index of detected features, used to find the co-eluting neighbours of a feature so
+/// their predicted isotope m/z can be forbidden as shift-decon anchors ([`four_way_decon_gated`]).
+///
+/// Built once over all detections. `forbidden_positions` returns, for one feature, the ascending
+/// isotope m/z of every *other* feature whose apex RT is within `rt_tol` and whose teeth fall in the
+/// query window — i.e. the peaks that belong to a co-eluting neighbour, not to this feature.
+pub struct NeighborIndex {
+    /// One entry per feature (parallel to the input slice): `(apex_rt, mono_mz, spacing, kmax)`.
+    grids: Vec<(f64, f64, f64, i32)>,
+    /// RT bin (`floor(apex_rt / rt_tol)`) → feature indices.
+    buckets: HashMap<i64, Vec<usize>>,
+    rt_tol: f64,
+}
+
+impl NeighborIndex {
+    /// Builds the index over `features`, bucketing by `rt_tol`-wide RT bins. Each feature's isotope
+    /// grid spans `k ∈ [0, num_isotopes_observed + 2]` (a little past the observed envelope).
+    pub fn build(features: &[DetectedFeature], rt_tol: f64) -> Self {
+        let mut grids = Vec::with_capacity(features.len());
+        let mut buckets: HashMap<i64, Vec<usize>> = HashMap::new();
+        let bin_of = |rt: f64| -> i64 { (rt / rt_tol).floor() as i64 };
+        for (i, f) in features.iter().enumerate() {
+            let spacing = C13_MINUS_C12 / f.charge.max(1) as f64;
+            grids.push((
+                f.apex_rt,
+                f.mono_mz,
+                spacing,
+                f.num_isotopes_observed as i32 + 2,
+            ));
+            buckets.entry(bin_of(f.apex_rt)).or_default().push(i);
+        }
+        NeighborIndex { grids, buckets, rt_tol }
+    }
+
+    /// Ascending isotope m/z of every feature other than `self_idx` that co-elutes with it
+    /// (`|Δapex_rt| ≤ rt_tol`) and whose teeth fall in `[win_min_mz, win_max_mz]`.
+    pub fn forbidden_positions(
+        &self,
+        self_idx: usize,
+        win_min_mz: f64,
+        win_max_mz: f64,
+    ) -> Vec<f64> {
+        let (self_rt, ..) = self.grids[self_idx];
+        let bin = (self_rt / self.rt_tol).floor() as i64;
+        let mut out: Vec<f64> = Vec::new();
+        for b in (bin - 1)..=(bin + 1) {
+            let Some(idxs) = self.buckets.get(&b) else { continue };
+            for &j in idxs {
+                if j == self_idx {
+                    continue;
+                }
+                let (rt, mono_mz, spacing, kmax) = self.grids[j];
+                if (rt - self_rt).abs() > self.rt_tol {
+                    continue;
+                }
+                for k in 0..=kmax {
+                    let m = mono_mz + k as f64 * spacing;
+                    if m < win_min_mz {
+                        continue;
+                    }
+                    if m > win_max_mz {
+                        break;
+                    }
+                    out.push(m);
+                }
+            }
+        }
+        out.sort_by(f64::total_cmp);
+        out
+    }
+}
+
 /// Which of the four strategy×view combinations produced a verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeconView {
-    /// Classic deconvolution on the averaged apex±3 composite (what [`refine_feature`] uses).
+    /// Classic deconvolution on the averaged apex±1 composite (what [`refine_feature`] uses).
     ClassicComposite,
     /// Classic deconvolution on the single apex scan.
     ClassicApex,
@@ -288,7 +480,7 @@ struct FeatureSlices {
     anchor_min: f64,
 }
 
-/// Builds the averaged apex±3 composite and the apex-scan slice for a feature, over the same m/z
+/// Builds the averaged apex±1 composite and the apex-scan slice for a feature, over the same m/z
 /// window [`refine_feature`] uses. Returns `None` on the same degenerate conditions
 /// (`refine_feature` would also return `None`): empty scans/peaks, empty window, or empty composite.
 fn build_feature_slices(
@@ -403,6 +595,17 @@ fn make_verdict(
 /// The two composite views reuse the exact averaging window and pick logic of [`refine_feature`];
 /// the two apex views run on the single apex scan. `shift_tol_ppm` is the ppm tolerance for the
 /// shift-decon peak matching (the classic views use `decon_params`).
+/// How the shift-decon views choose their anchor (most-abundant reference) peak.
+enum ShiftAnchor<'a> {
+    /// Tallest peak in the envelope window (original; prone to grabbing a stronger neighbour).
+    TallestInWindow,
+    /// Tallest peak in the window that is not attributed to a co-eluting neighbour ([`shift_decon_gated`]).
+    NeighborGated { forbidden: &'a [f64], grid_ppm: f64 },
+    /// The detector's own most-abundant claimed peak (tallest of `feature.peaks`) — cannot grab any
+    /// foreign peak because it uses the detector's own attribution of the feature's signal.
+    DetectorPeak,
+}
+
 pub fn four_way_decon(
     feature: &DetectedFeature,
     scans: &[Scan],
@@ -410,9 +613,78 @@ pub fn four_way_decon(
     decon_params: &ClassicDeconvolutionParameters,
     shift_tol_ppm: f64,
 ) -> FourWayDecon {
+    four_way_decon_inner(
+        feature,
+        scans,
+        averaging_params,
+        decon_params,
+        shift_tol_ppm,
+        ShiftAnchor::TallestInWindow,
+    )
+}
+
+/// **Detector-anchored** [`four_way_decon`]: the shift views anchor on the detector's own
+/// most-abundant claimed peak (the tallest of `feature.peaks`), which can never be a foreign peak.
+pub fn four_way_decon_detector_anchor(
+    feature: &DetectedFeature,
+    scans: &[Scan],
+    averaging_params: &SpectralAveragingParameters,
+    decon_params: &ClassicDeconvolutionParameters,
+    shift_tol_ppm: f64,
+) -> FourWayDecon {
+    four_way_decon_inner(
+        feature,
+        scans,
+        averaging_params,
+        decon_params,
+        shift_tol_ppm,
+        ShiftAnchor::DetectorPeak,
+    )
+}
+
+/// **Neighbor-aware** [`four_way_decon`]: the two shift views anchor with [`shift_decon_gated`],
+/// excluding peaks that belong to an already-detected neighbour (any peak within `grid_ppm` of a
+/// `forbidden_mz` position that is not on this feature's own isotope grid). `forbidden_mz` — the
+/// predicted isotope m/z of co-eluting neighbours in this feature's window — must be ascending. The
+/// classic views are unchanged (they are already tethered to the feature's mono and rarely drift).
+pub fn four_way_decon_gated(
+    feature: &DetectedFeature,
+    scans: &[Scan],
+    averaging_params: &SpectralAveragingParameters,
+    decon_params: &ClassicDeconvolutionParameters,
+    shift_tol_ppm: f64,
+    forbidden_mz: &[f64],
+    grid_ppm: f64,
+) -> FourWayDecon {
+    four_way_decon_inner(
+        feature,
+        scans,
+        averaging_params,
+        decon_params,
+        shift_tol_ppm,
+        ShiftAnchor::NeighborGated { forbidden: forbidden_mz, grid_ppm },
+    )
+}
+
+fn four_way_decon_inner(
+    feature: &DetectedFeature,
+    scans: &[Scan],
+    averaging_params: &SpectralAveragingParameters,
+    decon_params: &ClassicDeconvolutionParameters,
+    shift_tol_ppm: f64,
+    anchor: ShiftAnchor,
+) -> FourWayDecon {
     let detector_mono = feature.monoisotopic_mass;
     let charge = feature.charge;
     let mut verdicts: Vec<DeconVerdict> = Vec::new();
+    // Own isotope grid for the gated anchor: peaks at `mono_mz + k·spacing`, k up to n_iso + 2.
+    let own_kmax = feature.num_isotopes_observed + 2;
+    // The detector's most-abundant claimed peak m/z (tallest of feature.peaks), for DetectorPeak.
+    let detector_anchor_mz = feature
+        .peaks
+        .iter()
+        .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
+        .map(|p| p.m() as f64);
 
     if let Some(s) = build_feature_slices(feature, scans, averaging_params) {
         // Classic composite.
@@ -451,10 +723,19 @@ pub fn four_way_decon(
                 score,
             ));
         }
-        // Shift composite.
-        if let Some(r) =
-            shift_decon_in_window(&s.comp_mz, &s.comp_int, s.anchor_min, s.range_max, charge, shift_tol_ppm)
-        {
+        // Shift composite — anchor per the selected strategy.
+        let sc = match &anchor {
+            ShiftAnchor::TallestInWindow => shift_decon_in_window(
+                &s.comp_mz, &s.comp_int, s.anchor_min, s.range_max, charge, shift_tol_ppm,
+            ),
+            ShiftAnchor::NeighborGated { forbidden, grid_ppm } => shift_decon_gated(
+                &s.comp_mz, &s.comp_int, s.anchor_min, s.range_max, charge, shift_tol_ppm,
+                feature.mono_mz, own_kmax, forbidden, *grid_ppm,
+            ),
+            ShiftAnchor::DetectorPeak => detector_anchor_mz
+                .and_then(|a| shift_decon(&s.comp_mz, &s.comp_int, a, charge, shift_tol_ppm)),
+        };
+        if let Some(r) = sc {
             verdicts.push(make_verdict(
                 DeconView::ShiftComposite,
                 r.monoisotopic_mass,
@@ -465,9 +746,18 @@ pub fn four_way_decon(
             ));
         }
         // Shift apex.
-        if let Some(r) =
-            shift_decon_in_window(&s.apex_mz, &s.apex_int, s.anchor_min, s.range_max, charge, shift_tol_ppm)
-        {
+        let sa = match &anchor {
+            ShiftAnchor::TallestInWindow => shift_decon_in_window(
+                &s.apex_mz, &s.apex_int, s.anchor_min, s.range_max, charge, shift_tol_ppm,
+            ),
+            ShiftAnchor::NeighborGated { forbidden, grid_ppm } => shift_decon_gated(
+                &s.apex_mz, &s.apex_int, s.anchor_min, s.range_max, charge, shift_tol_ppm,
+                feature.mono_mz, own_kmax, forbidden, *grid_ppm,
+            ),
+            ShiftAnchor::DetectorPeak => detector_anchor_mz
+                .and_then(|a| shift_decon(&s.apex_mz, &s.apex_int, a, charge, shift_tol_ppm)),
+        };
+        if let Some(r) = sa {
             verdicts.push(make_verdict(
                 DeconView::ShiftApex,
                 r.monoisotopic_mass,
