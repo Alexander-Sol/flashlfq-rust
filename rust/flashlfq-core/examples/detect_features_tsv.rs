@@ -318,6 +318,13 @@ fn main() {
         timings.push(("four-way decon".into(), t_fw.elapsed().as_secs_f64()));
     }
 
+    // DIFF_REFINE=1 exports the features CLASSIC refine drops (no envelope) but the detector-anchored
+    // SHIFT refine keeps — the completeness gain behind the +2.4% recall. Feeds make_gain_targets.py.
+    if std::env::var("DIFF_REFINE").is_ok() {
+        let dpath = sibling(out_path, "refinediff");
+        run_refine_diff(&detected, &scans, &avg, &decon, &dpath);
+    }
+
     // --- resolve charge-state consensus --------------------------------------------------------
     let t3 = Instant::now();
     let resolved = resolve_charge_state_consensus(&refined, 10.0, 0.1);
@@ -373,6 +380,49 @@ fn main() {
         }
         Err(e) => eprintln!("  WARN: could not write timing log {log_path} ({e})"),
     }
+}
+
+/// Exports features that classic `refine_feature` drops (returns `None`) but detector-anchored
+/// `refine_feature_shift` (apex) keeps — the completeness gain. Columns feed `make_gain_targets.py`
+/// (which joins to the reference): shift-refined mono, apex RT, charge, most-abundant peak m/z.
+fn run_refine_diff(
+    detected: &[DetectedFeature],
+    scans: &[flashlfq_core::peak_indexing::Scan],
+    avg: &flashlfq_core::spectral_averaging::SpectralAveragingParameters,
+    decon: &ClassicDeconvolutionParameters,
+    path: &str,
+) {
+    let mut w = match open_out(path) {
+        Some(w) => w,
+        None => return,
+    };
+    writeln!(w, "Mono\tRT\tCharge\tPk MZ\tSummed Intensity").unwrap();
+    let mut n_gain = 0usize;
+    for f in detected {
+        // Classic kept it → not a gain.
+        if refine_feature(f, scans, avg, decon).is_some() {
+            continue;
+        }
+        if let Some(r) = refine_feature_shift(f, scans, avg, 20.0, true) {
+            n_gain += 1;
+            let pk = f
+                .peaks
+                .iter()
+                .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
+                .map(|p| p.m() as f64)
+                .unwrap_or(f.mono_mz);
+            writeln!(
+                w,
+                "{:.5}\t{:.4}\t{}\t{:.5}\t{:.4e}",
+                r.refined_monoisotopic_mass, f.apex_rt, f.charge, pk, f.summed_intensity
+            )
+            .unwrap();
+        }
+    }
+    let _ = w.flush();
+    eprintln!(
+        "  DIFF_REFINE: {n_gain} features shift-kept but classic-dropped -> {path}"
+    );
 }
 
 /// Runs the four-way decon comparator over every detected feature, reports the disagreement rate to
