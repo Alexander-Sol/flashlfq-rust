@@ -65,6 +65,29 @@ Per-charge breakdown at `MIN_ISOTOPES=2`, 10 ppm (each peak credited to its stro
 At `MIN_ISOTOPES=3` (the trustworthy charge prior): z2 32.6% / z3 19.5% / z4 10.3% / z5 4.8% /
 z6 1.9%, summing to 69.0%.
 
+**Including charge 1 (`MIN_Z=1`).** z1 spacing is 1.00335 Th — the widest, so z1 chains are the
+*least* coincidental (real peaks a full Da apart). At min 2 the total rises to **90.6%** with z1
+contributing **18.5%**; at min 3, **79.3%** with z1 at 13.5%.
+
+| z | % ΣTIC (min 2, `MIN_Z=1`) | % ΣTIC (min 3) |
+|---|---|---|
+| 1 | 18.5% | 13.5% |
+| 2 | 32.5% | 30.2% |
+| 3 | 20.5% | 19.1% |
+| 4 | 11.1% | 10.1% |
+| 5 | 5.5% | 4.6% |
+| 6 | 2.5% | 1.8% |
+| **all** | **90.6%** | **79.3%** |
+
+Note the total rose only 78.9%→90.6% (+11.7%), not +18.5%: `assign_charge` tests z1 first and
+ties-break to the lower charge, so ~6.8% of TIC previously credited to z2–6 was *reassigned* to z1
+(a peak in an equally-long z1 chain flips to z1). The z2–6 rows all tick down accordingly, and a
+clean z3 pair can fragment when one member is also 1 Da from another peak (visible in scan 1200:
+m/z 376.84 flips z3→z1). **z1 is almost entirely non-peptide** under ESI (contaminants, small
+molecules, solvent clusters), so the peptide-relevant ceiling is the multiply-charged sum: **~72%
+(min 2) / ~66% (min 3)**. Including z1 sharpens the coverage conclusion below — `COVERAGE_TARGET=0.90`
+reaches not only into unstructured noise but into singly-charged background that isn't the analyte.
+
 **Reading of the numbers.**
 
 - **~21% of ΣTIC has no isotope structure** (unstructured at min 2; ~31% at min 3). This is a hard
