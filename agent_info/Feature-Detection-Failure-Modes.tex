@@ -1,0 +1,659 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue,
+  citecolor=black
+}
+
+\newcommand{\ppm}{\,\text{ppm}}
+\newcommand{\Da}{\,\text{Da}}
+\newcommand{\Th}{\,\text{Th}}
+\newcommand{\Cthirteen}{\textsuperscript{13}C}
+\newcommand{\mz}{\ensuremath{m/z}}
+\newcommand{\zeq}[1]{\ensuremath{z{=}#1}}
+
+\title{Failure Modes in Untargeted MS1 Feature-Detection Algorithms}
+\author{Alex Solivais}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This chapter is an empirical study of \emph{why} an untargeted (de-novo, no-identification)
+MS1 feature-detection pipeline fails to recover peptide features, and of what fixes
+each failure demands. The vehicle is a pure-Rust reimplementation of FlashLFQ extended
+with a three-stage untargeted pipeline (detect $\rightarrow$ refine $\rightarrow$ resolve),
+validated by matching its output against FlashLFQ's identification-driven quantified peaks
+on a carbonic-anhydrase tryptic HCD run acquired on a Thermo Orbitrap Fusion Lumos. Over one
+extended investigation, reference recall rose from $589/620$ ($95.0\%$) to $602/620$ ($97.1\%$)
+and charge-matched recall from $564$ ($91.9\%$) to $584$ ($94.2\%$) by diagnosing and repairing
+a sequence of distinct failure modes. Rather than present only the working pipeline, this chapter
+organises those failures into a taxonomy by pipeline stage and by root mechanism, and for each
+gives symptom, mechanism, concrete evidence (named peptide with masses, \mz, retention time, and
+fit scores), the fix, and the generalisable lesson. It devotes a dedicated section to
+\emph{negative} results --- fixes that regressed recall and were therefore reverted --- because
+those are as instructive as the successes and prevent repeated effort. It closes with design
+principles for isotope-envelope feature detectors and a candid accounting of the misses that
+remain. Where a claim rests on a single traced example, this is stated explicitly.
+\end{abstract}
+
+\tableofcontents
+
+\section{Scope, pipeline, and validation methodology}
+\label{sec:scope}
+
+\subsection{The pipeline under study}
+The system is a de-novo MS1 feature detector: it receives centroided MS1 scans and must
+produce a list of peptide-level features (monoisotopic neutral mass, charge state(s),
+retention-time (RT) extent, intensity) with \emph{no} peptide identifications as input. It
+has three stages.
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{Detect} (\texttt{trace\_kernel.rs}). A sparse matched-filter / trace-kernel
+  detector. Every centroid is a candidate seed; seeds are processed tallest-first. For each
+  seed, a charge is decided by scoring an isotope-comb $\times$ RT-Gaussian hypothesis over
+  \zeq{z} for $z \in [z_{\min}, z_{\max}]$ and keeping the highest response (\emph{cross-charge
+  non-maximum suppression}, cross-$z$ NMS). The winning feature's peaks are then \emph{claimed}
+  --- removed from further seeding --- so overlapping harmonics cannot re-fire. The default
+  scorer is \texttt{RawSum}, an un-normalised $\sum_k \sum_s w_k\, g_s\, I_{k,s}$ over comb
+  teeth $k$ and RT scans $s$. A coverage-target stop and a chromatographic-persistence gate
+  ($\geq 2$ distinct scans) bound the feature population.
+  \item \textbf{Refine} (\texttt{feature\_refinement.rs}, \texttt{isotope\_shift\_decon.rs}).
+  Each detected feature is deconvolved on an averaged apex composite ($\leq 3$ scans, apex $\pm 1$)
+  and/or the single apex scan. A FlashLFQ-style \Cthirteen{} isotope-shift search ($-1/0/+1$, widened
+  to $-2\ldots+2$ at high charge) places the monoisotope; an \emph{envelope-fit cosine} metric
+  selects charge and monoisotope. A high-charge \emph{mono walk-back} corrects heavy-peptide
+  off-by-one-too-high placements.
+  \item \textbf{Resolve} (\texttt{feature\_refinement::resolve\_charge\_state\_consensus}).
+  Refined features are knitted into peptide-level features by single-linkage grouping on
+  co-elution plus off-by-one-aware mass agreement, then a cross-charge mass vote settles the
+  consensus monoisotopic mass.
+\end{enumerate}
+
+\subsection{Validation data and metric}
+\label{sec:validation-data}
+The benchmark is a carbonic-anhydrase (``CA'') tryptic digest, HCD fragmentation, $10$-minute
+gradient, acquired on a Thermo Lumos (\num{2689} MS1 scans, uncalibrated \texttt{.raw}). The
+reference is FlashLFQ's \texttt{AllQuantifiedPeaks.tsv} from a wide-tolerance
+MetaMorpheus/GPTMD search ($634$ rows; $\sim620$ quantifiable peaks after filtering MBR/decoy
+rows with non-numeric RT/intensity). \textbf{Recall} is the fraction of reference peaks
+rediscovered by the untargeted output within $\pm 20\ppm$ mass and $\pm 0.3$ min RT;
+\textbf{charge-matched recall} additionally requires the charge state to agree.
+
+Two methodological cautions are load-bearing throughout this chapter.
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{A systematic \boldmath$\sim+10\ppm$ calibration offset.} The reference
+  \texttt{Peptide Monoisotopic Mass} is the \emph{theoretical} peptide mass; the raw file is
+  \emph{uncalibrated}. Untargeted masses therefore run systematically $\sim +10\ppm$ high
+  against the reference. This is instrument calibration, not a detector error. Concretely,
+  EFLDVIK's theoretical reference mass is $862.480\Da$ while the untargeted pipeline resolves
+  it at $862.488\Da$ --- a $\sim 9\ppm$ offset, not a mono-placement error. Matches are
+  accepted within an integer-\Cthirteen{} offset plus residual ppm.
+  \item \textbf{Compare on observed \mz, not theoretical mass.} The reference \texttt{Peak MZ}
+  is the \emph{most-abundant} isotope \mz, not the monoisotopic \mz; for $z \geq 2$ it sits
+  $\sim 1$ \Cthirteen{} above the mono ($\approx +0.5\Th$ at \zeq{2}). Observed-vs-observed \mz
+  agreement is dead-on ($\pm 1$--$2\ppm$); the residual $\sim +10\ppm$ appears only in
+  theoretical-vs-observed comparisons.
+\end{itemize}
+
+\subsection{How to read this chapter}
+The failure modes are organised by pipeline stage (Sections~\ref{sec:mono}--\ref{sec:detector}),
+because the stage locates the fix, but the deeper organising axis is \emph{root mechanism}: most
+failures reduce to one of four mechanisms --- (i) a scoring window that cannot see signal on one
+side of the hypothesis; (ii) harmonic ($z \leftrightarrow 2z$) ambiguity inherent to isotope-comb
+matching; (iii) anchoring a deconvolution on the wrong (stronger, foreign) peak; and (iv)
+aggregating cross-charge evidence by quantity or intensity rather than by fit quality.
+Table~\ref{tab:summary} maps every documented failure to its stage, mechanism, traced peptide,
+and fix; Table~\ref{tab:progression} records the recall progression across the fixes.
+
+\section{Monoisotope placement}
+\label{sec:mono}
+
+\subsection{Heavy-peptide off-by-one-too-high, and the window blind spot}
+\label{sec:walkback}
+
+\paragraph{Symptom.} Heavy, highly-charged peptides are recovered at the correct charge and
+approximate mass but with the monoisotope placed one or two \Cthirteen{} units too high, so the
+neutral mass is $\sim 1$--$2\Da$ heavy and the reference match fails.
+
+\paragraph{Mechanism.} For a heavy peptide the isotopic envelope \emph{mode} (its tallest tooth)
+sits one or more \Cthirteen{} above the true monoisotope. The detector seeds on the tallest peak;
+the shift search, when its anchor or slice differs from the ideal, can then place the mono on a
+peak one or two \Cthirteen{} above the true one. Crucially, the envelope-fit cosine metric that
+scores placements uses a window that begins at $\text{mono} - 0.5\cdot\Delta$ (where $\Delta$ is
+the isotope spacing). A too-high placement's window therefore \emph{never sees} the strong true-mono
+peak sitting just below it: the unexplained signal beneath the hypothesis is off-grid, so the
+wrong placement scores as cleanly as the right one. This is the \emph{window blind spot}: a fit or
+correlation window that does not extend below the monoisotope is structurally incapable of
+detecting an off-by-one-too-high.
+
+\paragraph{Evidence.} Traced on \textbf{ECCHGDLLECADDRADLAK} (reference monoisotopic mass
+$2246.9355\Da$, \zeq{4}, RT $12.153$~min; mono \mz\ $562.741$, $+1$ at $562.997$, $+2$ at
+$563.243$). The detector seeded the mono on the $+2$ isotope ($562.247$, mass $\approx 2248.96$).
+A placement one \Cthirteen{} too high (mass $2247.9578$) scores cosine $0.934$ --- an apparently
+acceptable fit --- precisely because the strong $562.746$ peak ($\approx\!8.0\times10^{6}$
+intensity) lies just below the window and is invisible to the metric.
+
+\paragraph{Fix and why it works.} \texttt{walkback\_mono\_high\_charge} re-scores the chosen mono
+against its $1$- and $2$-\Cthirteen-lower alternatives and adopts the \emph{lowest-mass} hypothesis
+whose fit is within a small margin ($\texttt{WALKBACK\_FIT\_MARGIN} = 0.01$) of the best. The lower
+alternatives' windows \emph{do} include the peaks beneath the original placement, so they can finally
+see the unexplained signal that condemned it. The check is self-protecting: a correctly-placed mono's
+lower alternatives predict a leading tooth where nothing is observed, so they fit far worse and a good
+mono is never walked back. It is gated on mass $\geq 2200\Da$ and $|z| \geq 3$ --- the heavy-peptide
+regime where the mode sits well above the mono. On ECC the walk-back recovers $2246.953\Da$ (a dead-on
+reference match within the calibration offset).
+
+\paragraph{Generalisable insight.} A model-selection metric must be able to see signal on
+\emph{both} sides of the hypothesis it scores. A one-sided window silently converts an entire
+directional error class (here, mono-too-high) into a blind spot; the fix is either to widen the
+window (but see Section~\ref{sec:neg-window} for why na\"ive widening regressed) or to add an
+explicit, gated re-scoring against lower-mass alternatives whose windows \emph{do} reach the
+missing evidence.
+
+\section{Charge assignment: harmonic ambiguity}
+\label{sec:charge}
+
+Isotope-comb matching has an inherent degeneracy: the teeth of a charge-\zeq{z} envelope
+(spacing $\Delta = 1.00335\Da / z$) are a \emph{subset} of the charge-\zeq{2z} grid (spacing
+$\Delta/2$). A \zeq{z} hypothesis and a \zeq{2z} hypothesis can therefore both ``explain'' the
+same peaks. Which way the ambiguity bites depends on what fills --- or fails to fill --- the
+intervening teeth.
+
+\subsection{Charge-halving (real \boldmath\zeq{2} labelled \zeq{1})}
+\label{sec:halving}
+
+\paragraph{Symptom.} A genuine light \zeq{2} peptide is detected but assigned \zeq{1}, halving its
+neutral mass, so it never matches the true-mass reference. This class accounted for $\sim 10$
+peptides (light \zeq{2}, $788$--$907\Da$, \mz\ $\sim 395$--$455$).
+
+\paragraph{Mechanism.} A \zeq{2} envelope's \emph{even} isotopes (\mz\ $432.25, 433.25, 434.25,
+\ldots$) themselves form a valid $1.0$-\Th\ \zeq{1} comb. The \texttt{RawSum} charge scorer
+(Eq.~\ref{eq:rawsum-ch}) rewards matched intensity but never penalises the strong \emph{intervening}
+\zeq{2} peaks (the $+1$ at $432.75$) that a \zeq{1} hypothesis leaves unexplained. \zeq{2} explains
+every observed peak; \zeq{1} explains every \emph{other} one and ignores the rest --- yet \zeq{1}
+out-scores \zeq{2}. Refine and resolve then faithfully carry the halved mass.
+\begin{equation}
+\texttt{RawSum}(z) \;=\; \sum_{k}\sum_{s} w_k\, g_s\, I_{k,s},
+\label{eq:rawsum-ch}
+\end{equation}
+un-normalised and never decremented, is blind to both missing predicted teeth and unexplained
+observed peaks.
+
+\paragraph{Evidence.} Traced on \textbf{EFLDVIK} (reference mass $862.480\Da$ theoretical, true
+\zeq{2}, RT $14.70$~min; most-abundant \mz\ $432.251$). The strongest feature at that \mz\
+($432.28$, intensity $8.7\times10^{8}$) was seeded and assigned \zeq{1} $\rightarrow$ mono
+$431.28\Da$ = half the true $862.48\Da$. Raising the coverage target ($0.90\rightarrow 0.95$;
+\num{96000}$\rightarrow$\num{143000} features) recovered \emph{zero} additional reference peaks and
+left the miss set byte-identical --- proof that this is a charge-scoring failure, not a detection-depth
+one. The envelope-fit cosine cleanly ranks the charges: \zeq{2} $0.984 >$ \zeq{1} $0.905 >$ \zeq{3}
+$0.718$ (see the companion note \emph{An Envelope-Fit Metric for Charge-State and Monoisotope
+Selection} for the full derivation and the completeness/explained-fraction decomposition).
+
+\paragraph{Fix and why it works.} Charge \emph{re-selection} in refine
+(\texttt{best\_charge\_by\_fit}) re-scores the candidate charges $\{z/2, z, 2z\}$ by the
+envelope-fit cosine, which \emph{does} penalise the intervening peaks the \zeq{1} comb leaves
+unexplained (they enter the cosine as $(t=0, o=I)$ slots that inflate $\lVert o \rVert$ with no
+numerator contribution). The metric places the mono where the whole envelope is explained, not
+where a subset comb happens to land. This made detector-anchored shift decon $+$ envelope-fit
+recharge the pipeline default and took recall $89.5\% \rightarrow 95.0\%$ (charge $85.3\%
+\rightarrow 91.0\%$); the ``absent-miss'' class fell $13 \rightarrow 3$. EFLDVIK now resolves at
+$862.488\Da$ / \zeq{2}.
+
+\paragraph{Generalisable insight.} A charge scorer used for cross-$z$ NMS must reward
+\emph{explaining the intervening teeth}, not just matched intensity; equivalently, it must
+penalise the signal a lower-charge subset comb ignores. \texttt{RawSum}'s un-normalised matched
+filter cannot do this by construction, which is the structural motivation for the envelope-fit
+cosine.
+
+\subsection{Charge-doubling (real \boldmath\zeq{z} labelled \zeq{2z})}
+\label{sec:doubling}
+
+\paragraph{Symptom.} The mirror image: in crowded windows, charge re-selection promotes a genuine
+\zeq{z} feature to \zeq{2z}, doubling its mass and losing the peak. This is the danger the
+recharge machinery itself introduces, and it was widespread, not confined to the traced case.
+
+\paragraph{Mechanism.} Because the \zeq{z} teeth are a subset of the \zeq{2z} grid, and in a
+crowded window co-eluting \emph{interferents} happen to fill the intervening \zeq{2z} teeth, the
+\zeq{2z} hypothesis ``explains more'' and wins a strict argmax over $\{z/2, z, 2z\}$. A relative
+margin alone cannot save the true charge here: the correct \zeq{z} envelope may genuinely fit
+\emph{poorly} (weak, overlapped), so there is no relative gap to defend it with.
+
+\paragraph{Evidence.} Traced on the sodium adduct \textbf{HVGDLGNVTAD[Na]K} (reference mass
+$1246.5918\Da$, true \zeq{2}, RT $11.238$~min, weak at $2.75\times10^{6}$; mono \mz\ $624.309$).
+The detector had \zeq{2} right, but strict-argmax recharge doubled it to \zeq{4} (mass $2492.20$).
+The measured fits are \zeq{1} $0.235$, \zeq{2} $0.258$, \zeq{4} $0.689$: the correct \zeq{2}
+envelope \emph{genuinely fits poorly}, and the spurious \zeq{4} ``win'' is only a mediocre cosine
+($\sim0.69$) earned by absorbing interferents on the denser grid. No margin over the true charge
+exists to protect it.
+
+\paragraph{Fix and why it works.} \texttt{best\_charge\_by\_fit} keeps the detector's own charge
+(\texttt{prefer\_charge}) unless an alternative \emph{both} beats it by
+$\texttt{RECHARGE\_PREFER\_MARGIN}=0.05$ \emph{and} itself clears an \emph{absolute} floor
+$\texttt{RECHARGE\_MIN\_FIT}=0.85$. The absolute floor is the key discriminator: a spurious
+harmonic win is only $\sim0.69$, well under the floor, whereas a genuine re-charge (e.g. the light
+\zeq{2} charge-halving recovery of Section~\ref{sec:halving}) fits cleanly at $\sim0.98$ and still
+fires. HVG now resolves at $1246.60\Da$ / \zeq{2}. Blocking spurious doubling took recall
+$96.6\% \rightarrow 97.1\%$ and charge-matched $92\% \rightarrow 94\%$ --- a dataset-wide effect.
+
+\paragraph{Generalisable insight.} Harmonic ($z \leftrightarrow 2z$) ambiguity is intrinsic to
+isotope-comb matching and cannot be resolved by relative fit comparison alone. It requires (a)
+\emph{loyalty} to a prior (here the detector's own charge, itself derived from independent
+evidence) and (b) an \emph{absolute} quality gate, so that a charge is only overridden by an
+alternative that is good in absolute terms, not merely better than a poor incumbent. Relative
+margins are necessary but not sufficient when the true hypothesis can itself fit badly.
+
+\section{Anchor selection}
+\label{sec:anchor}
+
+\subsection{The distant grab}
+\label{sec:distant-grab}
+
+\paragraph{Symptom.} A feature's deconvolution places the monoisotope several isotopes away, on a
+different species, drifting the mass by multiple \Cthirteen{} units.
+
+\paragraph{Mechanism.} When deconvolution anchors on the \emph{tallest peak in a wide window}, and
+that window contains a stronger co-eluting \emph{different} species several isotopes above the true
+feature, the anchor lands on the neighbour and the whole averagine template is placed relative to
+it --- putting the mono on the interloper. This ``distant grab'' was the root of $\sim78\%$ of the
+disagreements in a four-way (classic$\times$shift $\times$ composite$\times$apex) decon comparator.
+
+\paragraph{Fix and why it works.} Anchor the shift views on the \emph{detector's own} most-abundant
+claimed peak (\texttt{four\_way\_decon\_detector\_anchor}; the tallest of \texttt{feature.peaks}),
+so the deconvolution cannot grab a foreign peak at all. A neighbour-grid gating variant
+(\texttt{shift\_decon\_gated}, which excludes peaks on a co-eluting \emph{detected} neighbour's
+isotope grid unless they are on this feature's own grid) was also implemented, but it only reduced
+disagreement to $60.8\%$ because \emph{undetected} neighbours slip through; detector-anchoring
+collapsed disagreement $64.2\% \rightarrow 45.4\%$ (unanimous $35.8\% \rightarrow 54.6\%$) and won.
+
+\paragraph{Averagine keyed on the most-intense mass, not the monoisotope.} A related design choice
+underlies the anchor: the averagine template is keyed by the observed \emph{most-intense} (tallest)
+peak's mass, not by a monoisotope guess. The tallest peak is the highest-SNR, most accurately
+centroided, hardest-to-misassign point in the envelope; the monoisotope --- especially for heavy
+peptides whose mode sits above it --- is exactly the fragile quantity being recovered. Keying the
+template on the mono would be circular. The template's mode tooth is pinned at the anchor and the
+mono falls out as $\text{anchor} - \text{mode}\cdot\Delta$, corrected by the shift search. This
+mirrors the classic deconvolution's use of the observed most-intense peak as reference.
+
+\paragraph{Generalisable insight.} Anchor a deconvolution on the most robust observable, not on
+the quantity you are trying to estimate. When a window may contain foreign species, the safest
+anchor is one an upstream stage already committed to (the detector's claimed peak), because it
+cannot drift onto a neighbour.
+
+\subsection{The single apex scan beats the averaged composite}
+\label{sec:apex}
+A ground-truth cut (per-feature verdicts joined to the FlashLFQ peaks) showed that when the
+apex-composite and single-apex views disagree, the \emph{single apex scan} is correct $70\%$ of the
+time (classic decon) versus $16\%$ for the composite; per-view accuracy is classic-apex $90.2\%$,
+shift-apex $87.7\%$, shift-composite $86.7\%$, classic-composite $83.9\%$. Averaging even a small
+window pulls in co-eluting interference; the apex is a higher-SNR snapshot. This motivates the
+domain rule that the composite must stay small (Section~\ref{sec:open}) and the pipeline's default
+to the shift-apex view. \emph{Caveat:} these accuracies are from one dataset with narrow ($\sim1.9$~s
+FWHM) peaks; on longer gradients a slightly wider composite may be preferable.
+
+\section{Cross-charge resolution and knitting}
+\label{sec:resolve}
+
+The resolve stage knits refined features into peptide-level features. Its two sub-decisions ---
+\emph{which} features to merge, and \emph{which} mass to adopt for the merged group --- each have a
+characteristic failure.
+
+\subsection{Merging separately-eluting species as false off-by-ones}
+\label{sec:knit}
+
+\paragraph{Symptom.} A correctly-placed feature is dragged onto a wrong mass because it is knitted
+with a \emph{different} co-eluting species $\sim 1\Da$ away, which then out-votes it.
+
+\paragraph{Mechanism.} \texttt{features\_link} bridged any two features within $\pm 2$ \Cthirteen{}
+in mass and within the apex-RT window, with \emph{no co-elution check}. A different peptide
+$\sim 1\Da$ away that merely drifted inside the $0.1$-min window was knitted as a false off-by-one;
+being stronger, it dragged the consensus mass onto itself.
+
+\paragraph{Evidence (must split).} For \textbf{ECCHGDLLECADDRADLAK} (\zeq{4}, apex $12.153$~min,
+narrow elution window $[12.153, 12.169]$), the corrected \zeq{4} feature was wrongly merged with a
+\emph{different} co-eluting \zeq{2}/\zeq{3} species at $\sim 2247.94\Da$ (apex $12.252$~min, outside
+\zeq{4}'s window). The stronger interloper out-voted the corrected \zeq{4} and the true mono was
+lost. Note additionally that at \zeq{3}/\zeq{2} ECC's true mono peak ($749.986$ / $1124.475$~\mz)
+is \emph{genuinely absent} from the centroids (its envelope runs $+1, +2, +3, +4$), so those
+charges legitimately fit $+1$; only \zeq{4} sees the mono --- see Section~\ref{sec:datagaps}.
+
+\paragraph{Evidence (must stay knitted --- counter-example).}
+\textbf{DSCQGDSGGPVVCNGQLQGIVSWGYGCAQK} (reference mass $3183.3808\Da$, \zeq{3}, RT $15.414$~min)
+genuinely co-elutes at \zeq{3}/\zeq{4}/\zeq{5} (all apex $15.414$~min). These are the \emph{same}
+peptide at different charges and must remain knitted; the fix must not break them.
+
+\paragraph{Fix and why it works.} Off-by-one links ($k \neq 0$) are gated on tight co-elution
+(\texttt{features\_coelute\_tightly}): each feature's apex must fall inside the other's
+$[\text{start\_rt}, \text{end\_rt}]$ window (padded by $\pm 0.6$~s). Pure same-mass cross-charge
+links ($k = 0$, the same peptide at another charge) are untouched, so DSC's genuinely co-eluting
+charges still knit, while ECC's \zeq{4} splits from the \zeq{2}/\zeq{3} interloper whose apex lies
+outside \zeq{4}'s narrow window. This was the single largest lever of the session: $+9$ recall
+(part of $589 \rightarrow 598$), not just the traced peptide.
+
+\paragraph{Generalisable insight.} Chromatographic co-elution is a discriminator the mass domain
+alone does not have. Two species $\sim 1\Da$ apart are indistinguishable to an off-by-one mass test,
+but their elution profiles are not: requiring mutual apex-in-window co-elution before treating a
+$\sim 1\Da$ mass difference as an off-by-one uses the orthogonal RT axis to separate real
+mono-placement disagreements (same peptide) from coincidental mass neighbours (different peptides).
+
+\subsection{Consensus voting by count or intensity rather than fit}
+\label{sec:vote}
+
+\paragraph{Symptom.} The knitted group settles on the wrong monoisotopic mass even though a member
+placed it correctly.
+
+\paragraph{Mechanism, two variants.}
+\begin{enumerate}[label=(\alph*),leftmargin=1.8em]
+  \item \textbf{Count.} Two off-by-one siblings out-vote one correct placement when the group votes
+  by candidate count.
+  \item \textbf{Intensity.} A contaminated-but-stronger charge out-votes a clean but weaker one when
+  ties are broken by summed intensity.
+\end{enumerate}
+
+\paragraph{Evidence (intensity variant).} \textbf{AAVTAFWGK} (reference mass $992.508\Da$;
+FlashLFQ quantified it at \zeq{1} although the precursor was \zeq{2}; RT $16.31$~min; \zeq{1} mono
+\mz\ $993.515$). It is seen at \zeq{1} (envelope contaminated by co-eluting interferents; refine
+mis-places the mono $+1$, envelope-fit $0.39$) and at \zeq{2} (clean; correct mono, fit $0.99$).
+Both are lone singletons (support $1$), so an intensity-only tiebreak took the stronger-but-wrong
+\zeq{1} $+1$ mass and lost the true mono.
+
+\paragraph{Fix and why it works.} \texttt{resolve\_mass\_by\_cross\_charge} ranks mass clusters by
+the tuple $(\text{support},\, \text{count},\, \text{best decon\_score},\, \text{summed intensity})$.
+Distinct-charge \emph{support} stays the \emph{primary} key --- a genuine multi-charge agreement must
+still outrank a lone high-fit placement --- but the envelope-fit is inserted as a tiebreak
+\emph{before} intensity, so when support ties the clean placement wins. AAVTAFWGK now resolves at
+$992.517\Da$ / \zeq{1};\zeq{2}. Recall $598 \rightarrow 599$. Critically, promoting summed fit to the
+\emph{primary} key regressed recall (Section~\ref{sec:neg-fitprimary}); fit works only as a tiebreak
+after support.
+
+\paragraph{Generalisable insight --- cross-charge redundancy is the central resource.} When one
+charge state is ambiguous, contaminated, or missing its monoisotope, another charge of the same
+peptide often resolves it. But this redundancy pays off \emph{only if resolution weights quality
+over quantity and intensity}. A stronger contaminated charge and two off-by-one siblings are both
+``more'' evidence pointing the wrong way; fit quality is what distinguishes a clean placement from a
+loud wrong one. This is arguably the chapter's central positive insight: exploit cross-charge
+redundancy, but weight it by fit, with independent multi-charge agreement (support) as the primary
+anchor so a single high-fit outlier cannot override a genuine consensus.
+
+\section{Data-limited and inherent-ambiguity cases}
+\label{sec:datagaps}
+
+Not every off-by-one is an algorithm bug. Two classes are genuine data limitations, and honesty
+about them bounds what any algorithm can achieve.
+
+\paragraph{Missing monoisotope at some charges.} For some peptides the true monoisotope peak is
+simply \emph{absent} from the centroids at certain charges --- contamination or peak-picking drops
+it --- while present at others. \textbf{ECC} again: at \zeq{2}/\zeq{3} the mono \mz\ ($1124.475$ /
+$749.986$) is not in the centroids at all (the observed envelope begins at $+1$), so the envelope
+legitimately starts one \Cthirteen{} above the mono and the fit \emph{correctly} prefers the $+1$
+placement at those charges. The ``error'' is a real data gap. It is resolvable only by trusting the
+charge that \emph{does} see the mono (\zeq{4} here) --- which is exactly why cross-charge resolution
+(Section~\ref{sec:vote}) with quality weighting, not per-charge fit, is the right backstop.
+
+\paragraph{Contaminated envelopes in crowded regions.} Even the \emph{correct} charge can fit
+poorly when the window is crowded: AAVTAFWGK \zeq{1} fits $0.39$; HVG \zeq{2} fits $0.258$. In such
+regions absolute cosine values are low across all hypotheses and relative fit comparisons become
+unreliable --- the reason Section~\ref{sec:doubling}'s absolute floor and Section~\ref{sec:vote}'s
+support-primary ranking are needed rather than pure argmax-of-fit.
+
+\paragraph{Insight.} Distinguish genuine algorithm errors from data-limited inherent ambiguity.
+Some ``misses'' are cases where the monoisotope is not in the data at a given charge, or where the
+reference itself may be questionable. Chasing these with ever-more-aggressive placement heuristics
+risks regressing the cases that \emph{are} recoverable (see the negative results). The correct
+response is architectural: rely on the charge that sees the clean signal, via quality-weighted
+cross-charge consensus.
+
+\section{Detector-level artifacts}
+\label{sec:detector}
+
+\paragraph{Greedy tallest-first claiming.} The detector claims peaks tallest-first, and each peak
+is owned by exactly one feature (a claim partition). This is what makes cross-$z$ NMS work
+(a claimed harmonic cannot re-fire), but it creates artifacts that interact with refinement: in
+dense regions a real isotope tooth can be claimed first by a marginally-taller \emph{spurious}
+neighbour, so the claim partition is noisy. This directly explains why refine-stage peak censoring
+regressed recall (Section~\ref{sec:neg-censor}): deleting ``already-claimed'' peaks removes real
+teeth that the noisy partition mis-assigned.
+
+\paragraph{The \texttt{RawSum} charge score.} As formalised in Eq.~\ref{eq:rawsum-ch} and
+Section~\ref{sec:halving}, the default detector charge score is an un-normalised
+$\sum_k\sum_s w_k g_s I_{k,s}$ that neither penalises missing predicted teeth nor unexplained
+observed peaks. It is the upstream root of the charge-halving class and the structural motivation
+for the envelope-fit cosine downstream. A normalized matched-filter variant
+(\texttt{ScoreModel::NormalizedNoiseFloor}) was implemented and measured; it gave $+1.4\%$ recall
+but $-0.8\%$ charge and so failed its ``charge up or flat'' bar, and \texttt{RawSum} remains the
+detector default --- the charge fix was moved downstream into refine's envelope-fit recharge, which
+is where the cosine can see the whole envelope on a clean apex view.
+
+\paragraph{Insight.} A greedy claim partition is an implementation convenience, not ground truth;
+downstream stages must not treat ``claimed by another feature'' as ``not part of my envelope.''
+And the natural place to fix a charge error is wherever the richest evidence lives --- here,
+refine, where a high-SNR apex composite and a completeness-aware metric are both available.
+
+\section{Negative results}
+\label{sec:negative}
+
+These experiments regressed recall and were reverted. They are recorded because each rules out a
+plausible direction and explains \emph{why} the intuition failed.
+
+\subsection{Widening the envelope-fit window below the mono}
+\label{sec:neg-window}
+To attack the window blind spot (Section~\ref{sec:walkback}) directly, the envelope-fit window's
+lower reach was extended from $\text{mono}-0.5\cdot\Delta$ to $\text{mono}-2.5\cdot\Delta$ so the
+metric could see the peak below a too-high mono. This regressed recall both globally (to $586$) and
+when scoped only to the walk-back ($587$). \textbf{Why it fails:} a wider lower window admits
+\emph{legitimate} below-mono signal --- the $+1$/$+2$ teeth of a genuine lower-mass co-eluting
+species, or noise --- as spurious ``unexplained'' penalty against \emph{correct} placements,
+depressing good cosines more than it rescues bad ones. The targeted, self-protecting walk-back (which
+only \emph{prefers} a lower mono when it fits at least as well) succeeds precisely because it does
+not globally change what counts as in-window.
+
+\subsection{Fit-weighted consensus as the primary ranking key}
+\label{sec:neg-fitprimary}
+Ranking mass clusters by \emph{summed} \texttt{decon\_score} as the \emph{primary} key (instead of
+distinct-charge support) regressed recall. \textbf{Why it fails:} two off-by-one siblings still
+out-\emph{sum} one correct member, so summing fit reproduces the count failure it was meant to cure.
+This is the crucial contrast with Section~\ref{sec:vote}'s working fix, where fit is only a
+\emph{tiebreak after support}: independent multi-charge agreement must remain the primary anchor, or
+a pair of concordant-but-wrong placements overrides a lone correct one.
+
+\subsection{Over-broad walk-back gating}
+\label{sec:neg-walkback}
+The mono walk-back was tried at all charges, with only a $2000\Da$ mass floor, and with an
+$\text{argmax(template)} \geq 1$ mode gate ($\sim1500\Da$). All regressed (to $587$--$588$).
+\textbf{Why it fails:} at low charge / mid mass the fit metric's window cannot see below the mono
+(the same blind spot), so it scores a $+1$ placement above the true one and the walk-back
+\emph{over-corrects}, walking a correct mid-mass low-charge mono down to a wrong lower mass. The
+gate must key on the physical driver of the error --- high mass \emph{and} high charge, where the
+mode genuinely sits above the mono --- hence $\geq 2200\Da$ and $|z| \geq 3$.
+
+\subsection{Refine-stage subtractive censoring}
+\label{sec:neg-censor}
+Removing peaks claimed by \emph{other} features from a feature's composite before deconvolution
+(to clean chimeric windows) regressed recall substantially: baseline $88.2\%$ / $84.0\%$ charge
+$\rightarrow$ grid-gated censor $84.7\%$ / $77.9\%$ $\rightarrow$ full censor $83.9\%$ / $75.6\%$.
+\textbf{Why it fails, two mechanisms:} (1) classic deconvolution scores an envelope using the same
+neutral mass at \emph{other} charge states (\texttt{observe\_adjacent\_charge\_states}); those
+cross-charge peaks are off this feature's \mz\ grid, so censoring deletes the very cross-charge
+evidence decon relies on --- which is why the \emph{charge}-recall column drops hardest ($-6\%$).
+(2) The averaging normalises per-scan by TIC, so removing peaks reshuffles the composite. Combined
+with the noisy claim partition (Section~\ref{sec:detector}), censoring deletes real teeth.
+\textbf{Lesson:} already-assigned peaks are not merely interferents --- deconvolution exploits
+neighbouring and cross-charge peaks, so a claim partition must not be read as a segmentation.
+
+\subsection{Coverage depth as a recovery lever}
+\label{sec:neg-coverage}
+Raising the coverage target to detect more features ($0.90 \rightarrow 0.95$;
+$\sim\!\num{96000} \rightarrow \num{143000}$ features) recovered \emph{zero} additional reference
+peaks and left the miss set byte-identical (Section~\ref{sec:halving}). \textbf{Why it fails:} the
+misses were not undetected --- they were detected and then mislabelled (charge, mono, or knitting).
+Detection depth is the wrong knob when the loss is downstream; more darts do not help when the
+darts already land and are then mis-scored.
+
+\section{Synthesis: design principles}
+\label{sec:synthesis}
+
+The failures above, though they surface at different stages, teach a small set of transferable
+principles for isotope-envelope feature detectors.
+
+\begin{enumerate}[leftmargin=1.6em,label=\textbf{\arabic*.}]
+  \item \textbf{A scoring metric must see signal on both sides of its hypothesis.} A one-sided
+  window (mono $-0.5\Delta$ upward) is structurally blind to an error in the excluded direction
+  (mono-too-high). Either make the metric two-sided or add an explicit, tightly-gated re-scoring
+  against the alternatives whose windows reach the missing evidence (Sections~\ref{sec:walkback},
+  \ref{sec:neg-window}).
+  \item \textbf{Harmonic ambiguity needs absolute quality gates, not just relative comparison.}
+  The $z \leftrightarrow 2z$ degeneracy is inherent to comb matching. Because the true hypothesis can
+  itself fit poorly in crowded windows, a relative margin cannot protect it; combine loyalty to an
+  independent prior with an \emph{absolute} fit floor so a charge is overridden only by an
+  alternative that is good in absolute terms (Sections~\ref{sec:halving}, \ref{sec:doubling}).
+  \item \textbf{Chromatographic co-elution is a discriminator the mass domain lacks.} Species
+  $\sim 1\Da$ apart are indistinguishable to an off-by-one mass test but separable by elution
+  profile. Gate mass-based knitting on mutual apex-in-window co-elution (Section~\ref{sec:knit}).
+  \item \textbf{Exploit cross-charge redundancy, weighted by quality.} A peptide's other charge
+  states are the richest resource for resolving an ambiguous, contaminated, or mono-missing charge
+  --- but only if consensus weights fit quality, with independent multi-charge \emph{support} as the
+  primary key so neither a loud contaminated charge nor a pair of concordant-but-wrong siblings can
+  override a clean placement (Sections~\ref{sec:vote}, \ref{sec:neg-fitprimary}).
+  \item \textbf{Anchor estimation on the most robust observable.} Anchor deconvolution on the
+  highest-SNR peak (or an upstream committed claim), never on the fragile quantity being estimated;
+  this prevents both the distant grab and circular mono-keying (Section~\ref{sec:anchor}).
+  \item \textbf{Distinguish algorithm errors from data-limited inherent ambiguity.} Some misses are
+  genuine data gaps (mono absent at a charge) or questionable references; the correct response is
+  architectural (trust the charge that sees clean signal), not an ever-more-aggressive heuristic that
+  regresses recoverable cases (Section~\ref{sec:datagaps}).
+  \item \textbf{Adversarial and negative experiments are load-bearing.} Four of the most tempting
+  ``obvious'' improvements (wider window, fit-primary consensus, broad walk-back, censoring) all
+  regressed recall, each for an instructive reason. Measuring and reverting them --- and recording
+  \emph{why} --- is what prevents the same intuitions from being re-implemented (Section~\ref{sec:negative}).
+  \item \textbf{Fix an error where the richest evidence lives.} The charge-halving error originates
+  in the detector but is best fixed in refine, where a high-SNR apex composite and a
+  completeness-aware metric are both available (Sections~\ref{sec:halving}, \ref{sec:detector}).
+\end{enumerate}
+
+\section{Open problems and remaining misses}
+\label{sec:open}
+
+After the fixes above, $\sim 18$ reference peaks ($602/620$) remain unrecovered (an earlier snapshot:
+$22$ misses = $3$ genuinely absent $+ 19$ off-by-one). Off-by-one remains the single largest miss
+category. The open problems:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Contaminated single-charge features with no clean sibling.} The cross-charge
+  backstop (Section~\ref{sec:vote}) needs a second charge that sees the clean signal. When a peptide
+  is observed at only one charge and that charge's envelope is contaminated (low absolute fit, e.g.
+  $\sim0.25$--$0.39$), there is no clean vote to prefer and relative fit is unreliable. A
+  chimera-robust single-envelope discriminator (or a genuine multi-envelope NNLS unmixing of the
+  crowded window) is the plausible next step; a naive cosine corrector for this case regressed recall
+  in earlier work.
+  \item \textbf{Data-dependent averaging-window sizing.} The composite is hard-capped at $3$ scans
+  (apex $\pm 1$), tuned to the CA/Lumos $10$-min gradient's narrow $\sim1.9$~s FWHM. This is not
+  appropriate for longer gradients, where a feature spans more MS1 scans and averaging only $3$ would
+  discard real signal and clip the elution. The constant should be replaced by a scan count derived
+  from the measured chromatographic FWHM (the detector already measures FWHM via XIC half-max for its
+  RT $\sigma$), so it adapts to gradient length instead of being hard-coded.
+  \item \textbf{Genuine data gaps and reference quality.} Some remaining ``misses'' are cases where
+  the monoisotope is absent from the centroids at every observed charge, or where the reference peak
+  itself is questionable. These bound the achievable recall and should be characterised (via the
+  miss-explorer envelopes) rather than optimised against, to avoid regressing recoverable cases.
+  \item \textbf{Precision.} The shift-apex default roughly doubled the resolved-feature count versus
+  the classic path (the classic \texttt{None}-drop was an implicit quality filter). Recall improved,
+  but a precision/false-discovery accounting against the reference is an outstanding check.
+\end{itemize}
+
+\section*{Summary tables}
+\addcontentsline{toc}{section}{Summary tables}
+
+\begin{table}[h]
+\centering
+\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}p{2.0cm} p{3.5cm} p{3.2cm} p{4.4cm}@{}}
+\toprule
+\textbf{Stage} & \textbf{Failure / mechanism} & \textbf{Example peptide} & \textbf{Fix} \\
+\midrule
+Refine (mono) & Heavy off-by-one-too-high; fit-window blind below mono &
+  ECCHGDLLECADDRADLAK (\zeq{4}, $2246.94\Da$) &
+  Mono walk-back, gated mass $\geq 2200\Da$ \& $|z|\geq 3$ \\
+Detect / Refine (charge) & Charge-halving: even \zeq{2} isotopes form a valid \zeq{1} comb &
+  EFLDVIK (\zeq{2}, $862.48\Da$) &
+  Envelope-fit recharge over $\{z/2,z,2z\}$ \\
+Refine (charge) & Charge-doubling: \zeq{z} teeth are a subset of \zeq{2z}; interferents fill gaps &
+  HVGDLGNVTAD[Na]K (\zeq{2}, $1246.59\Da$) &
+  Detector-charge loyalty $+$ absolute fit floor $0.85$ \\
+Refine (anchor) & Distant grab: anchor on stronger foreign peak in wide window &
+  (four-way comparator, dataset-wide) &
+  Anchor on detector's own claimed peak \\
+Resolve (knit) & Separately-eluting species merged as false off-by-one &
+  ECC \zeq{4} vs \zeq{2}/\zeq{3} interloper &
+  Co-elution gate on off-by-one ($k\neq0$) links \\
+Resolve (vote) & Consensus by intensity/count over-rides clean placement &
+  AAVTAFWGK (\zeq{1} fit $0.39$ vs \zeq{2} $0.99$) &
+  Fit as tiebreak \emph{after} support (not primary) \\
+Data-limited & Mono absent from centroids at some charges &
+  ECC at \zeq{2}/\zeq{3} &
+  Trust the charge that sees the mono (\zeq{4}) \\
+Detect & \texttt{RawSum} ignores missing teeth \& unexplained peaks &
+  (root of charge-halving class) &
+  Envelope-fit cosine downstream \\
+\bottomrule
+\end{tabular}
+\caption{Failure-mode taxonomy: stage, root mechanism, traced example, and fix.}
+\label{tab:summary}
+\end{table}
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}l l c c@{}}
+\toprule
+\textbf{Step} & \textbf{Fix applied} & \textbf{Recall / 620} & \textbf{Charge-matched} \\
+\midrule
+Baseline (classic decon) & --- & $555$ ($89.5\%$) & $529$ ($85.3\%$) \\
+Detector-anchored shift-apex $+$ recharge & Secs.~\ref{sec:halving},~\ref{sec:distant-grab} & $589$ ($95.0\%$) & $564$ ($91.9\%$) \\
+Mono walk-back & Sec.~\ref{sec:walkback} & $589$ & $566$ \\
+Co-elution knitting gate & Sec.~\ref{sec:knit} & $598$ ($96.5\%$) & $570$ \\
+Fit tiebreak in consensus & Sec.~\ref{sec:vote} & $599$ ($96.6\%$) & $570$--$573$ \\
+Anti-doubling fit floor & Sec.~\ref{sec:doubling} & $602$ ($97.1\%$) & $584$ ($94.2\%$) \\
+\bottomrule
+\end{tabular}
+\caption{Recall progression across the session's fixes on CA/Lumos cov90 vs FlashLFQ. Intermediate
+charge-matched values ($566$, $570$, $573$) are reported where the source commits recorded them; the
+$589 \rightarrow 602$ recall trajectory and $529/564/584$ charge endpoints are the load-bearing
+figures. The $89.5\% \rightarrow 95.0\%$ jump is the shift-apex$+$recharge default; the walk-back
+alone left \emph{recall} flat at $589$ while lifting charge to $566$ (it corrects mass placement on
+already-counted features), with the co-elution gate delivering the next $+9$.}
+\label{tab:progression}
+\end{table}
+
+\section*{Sources and reproducibility}
+\addcontentsline{toc}{section}{Sources and reproducibility}
+All numbers are drawn from the pipeline's commit history and verified where possible against the
+data files. The reference peptide masses, charges, RTs, and \mz{} values in
+Sections~\ref{sec:mono}--\ref{sec:datagaps} were re-read directly from
+\texttt{AllQuantifiedPeaks.tsv} (wide-tolerance search) and agree with the traced values: ECC \zeq{4}
+$2246.9355\Da$ RT $12.153$ \mz\ $562.997$; HVG[Na] \zeq{2} $1246.5918\Da$ RT $11.238$ \mz\ $624.309$
+intensity $2.75\times10^{6}$; AAVTAFWGK \zeq{1} $992.508\Da$ RT $16.31$ \mz\ $993.525$; DSC \zeq{3}
+$3183.3808\Da$ RT $15.414$ \mz\ $1062.478$; EFLDVIK \zeq{2} theoretical $862.480\Da$ RT $14.70$ \mz\
+$432.251$. The full envelope-fit metric derivation (including the $S^2 = R^2$ explained-energy
+identity and the EFLDVIK completeness/explained-fraction table) is in the companion note
+\emph{An Envelope-Fit Metric for Charge-State and Monoisotope Selection}
+(\texttt{agent\_info/Envelope-Fit-Metric.tex}). Fit scores quoted for HVG (\zeq{1} $0.235$, \zeq{2}
+$0.258$, \zeq{4} $0.689$), AAVTAFWGK (\zeq{1} $0.39$, \zeq{2} $0.99$), and the walk-back ($0.934$ at
+$+1$) are from the traced-run diagnostics recorded in the commit messages and were not independently
+re-derived here.
+
+\end{document}
