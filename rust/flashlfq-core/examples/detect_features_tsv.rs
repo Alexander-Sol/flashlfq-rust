@@ -700,15 +700,30 @@ fn write_tsv(path: &str, resolved: &[ResolvedFeature]) {
         Some(w) => w,
         None => return,
     };
-    // `Mono m/z` is the monoisotopic-peak m/z; `Most-Abundant m/z` is the m/z of the tallest observed
-    // isotope peak (the detector seed) — the direct analogue of base FlashLFQ's observed `Peak MZ`,
-    // which for heavier peptides sits ~1 ¹³C step above the monoisotope.
+    // Columns lead with the observed-feature answer — the detected m/z, the RT extent, and every
+    // charge state seen — then follow with the derived mass/intensity fields.
+    //   `Detected m/z (primary)` is the tallest observed isotope-peak m/z of the tallest charge
+    //     (the detector seed) — the direct analogue of base FlashLFQ's observed `Peak MZ`, which for
+    //     heavier peptides sits ~1 ¹³C step above the monoisotope.
+    //   `Per-Charge Detected m/z` lists that same observed m/z for EVERY detected charge, as
+    //     `z<charge>:<m/z>` pairs (ascending by charge) — so a peptide seen at z2 and z3 shows both.
+    //   `Mono m/z (primary)` is the monoisotopic-peak m/z at the primary charge (derived from the
+    //     consensus neutral mass), for reference alongside the observed detected m/z.
     writeln!(
         w,
-        "Monoisotopic Mass\tCharge States\tNum Charge States\tPrimary Charge\tMono m/z (primary)\t\
-         Most-Abundant m/z\tRT Start\tRT Apex\tRT End\tSummed Intensity\tCross-Charge Support\tNum Members"
+        "Detected m/z (primary)\tRT Start\tRT Apex\tRT End\tCharge States\tPer-Charge Detected m/z\t\
+         Num Charge States\tPrimary Charge\tMonoisotopic Mass\tMono m/z (primary)\tSummed Intensity\t\
+         Cross-Charge Support\tNum Members"
     )
     .unwrap();
+    // Most-abundant observed isotope-peak m/z of one member's detection (its tallest claimed peak).
+    let member_detected_mz = |m: &RefinedFeature| -> Option<f64> {
+        m.detected
+            .peaks
+            .iter()
+            .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
+            .map(|p| p.m() as f64)
+    };
     for r in rows {
         // Primary member = the tallest member; its charge and its seed (tallest) peak drive the m/z.
         let primary_member = r.members.iter().max_by(|a, b| {
@@ -722,29 +737,41 @@ fn write_tsv(path: &str, resolved: &[ResolvedFeature]) {
         } else {
             0.0
         };
-        // Most-abundant isotope m/z = the tallest claimed peak of the primary member's detection.
-        let most_abundant_mz = primary_member
-            .and_then(|m| {
-                m.detected
-                    .peaks
+        let detected_mz = primary_member.and_then(member_detected_mz).unwrap_or(0.0);
+        // Observed detected m/z per charge state: for each detected charge, the tallest member of
+        // that charge and its most-abundant peak m/z, ascending by charge (`z2:497.2584;z3:331.8416`).
+        let per_charge_mz: Vec<String> = r
+            .charge_states
+            .iter()
+            .map(|&z| {
+                let mz = r
+                    .members
                     .iter()
-                    .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
+                    .filter(|m| m.refined_charge == z)
+                    .max_by(|a, b| {
+                        a.detected
+                            .summed_intensity
+                            .total_cmp(&b.detected.summed_intensity)
+                    })
+                    .and_then(member_detected_mz)
+                    .unwrap_or(0.0);
+                format!("z{z}:{mz:.4}")
             })
-            .map(|p| p.m() as f64)
-            .unwrap_or(0.0);
+            .collect();
         let charges: Vec<String> = r.charge_states.iter().map(|c| c.to_string()).collect();
         writeln!(
             w,
-            "{:.5}\t{}\t{}\t{}\t{:.5}\t{:.5}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{}\t{}",
-            r.monoisotopic_mass,
-            charges.join(";"),
-            r.charge_states.len(),
-            primary_charge,
-            mono_mz,
-            most_abundant_mz,
+            "{:.5}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}\t{:.5}\t{:.5}\t{:.4e}\t{}\t{}",
+            detected_mz,
             r.start_rt,
             r.apex_rt,
             r.end_rt,
+            charges.join(";"),
+            per_charge_mz.join(";"),
+            r.charge_states.len(),
+            primary_charge,
+            r.monoisotopic_mass,
+            mono_mz,
             r.summed_intensity,
             r.cross_charge_support,
             r.members.len()
