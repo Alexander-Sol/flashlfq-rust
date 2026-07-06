@@ -581,6 +581,95 @@ pub const RECHARGE_PREFER_MARGIN: f64 = 0.05;
 /// comfortably. See [`RECHARGE_PREFER_MARGIN`].
 pub const RECHARGE_MIN_FIT: f64 = 0.85;
 
+/// Fraction of the anchor (most-abundant) peak intensity that an observed peak on an **intervening**
+/// finer-grid isotope position may reach before [`best_charge_by_fit`] refuses to *halve* the
+/// detector charge onto a coarser grid.
+///
+/// A candidate charge that **divides** the detector's charge (e.g. z=1 winning over the detector's
+/// z=2) predicts only every `ratio`-th tooth of the finer (detector-charge) grid. If strong observed
+/// signal sits on the *intervening* teeth it cannot predict, its higher cosine is an artefact of
+/// ignoring real signal, not a better model — so the halving is rejected and the detector charge kept.
+///
+/// Traced on **DSCQGDSGGPVVCSGK** (mono 1608.6508, z=2, RT 10.776): its observed envelope is
+/// **mono-tallest** (k0..k3 ≈ 3.5/2.15/1.54/0.5 e6), but the averagine for a 1608-Da peptide predicts a
+/// **+1-tallest** shape, so the *true* z=2 template fits the mono-tallest data worse than the **z=1**
+/// comb — whose averagine mode at 804 Da *is* the mono. The z=1 comb reaches cosine 0.87 by matching
+/// only the even z=2 teeth (805.34, 806.34) and **skipping** the odd ones (805.84 ≈ 2.15e6, 806.84 ≈
+/// 0.5e6), which it leaves unexplained. Those intervening peaks are 2.15e6/3.5e6 = 0.61 of the anchor —
+/// far above this floor — so the halving is refused and z=2 kept. The existing `RECHARGE_PREFER_MARGIN`
+/// (0.05) and `RECHARGE_MIN_FIT` (0.85) did not block it: z=1 genuinely cleared 0.85 and beat z=2 by the
+/// margin. A **genuine** halving (a real z=1 the detector mislabelled z=2) has *empty* intervening
+/// positions (fraction ≈ 0), so it clears this gate untouched — preserving the light-z2 recovery.
+pub const RECHARGE_HALVING_MAX_INTERVENING: f64 = 0.30;
+
+/// Largest observed peak sitting on an **intervening** finer-grid isotope position — a position on the
+/// `z_hi` (detector-charge) grid that the coarser divisor charge `z_lo` does **not** predict — relative
+/// to the anchor peak intensity. Requires `z_lo < z_hi` and `z_hi % z_lo == 0`.
+///
+/// The intervening positions are scanned from the `z_lo` monoisotope upward across the `z_lo`
+/// significant envelope (`ratio = z_hi / z_lo` finer teeth per `z_lo` tooth; the `j % ratio == 0`
+/// positions are the `z_lo` teeth themselves and are skipped). Peaks within `excl_ppm` of an
+/// `excluded` (neighbour-owned) position, and peaks at/below `noise_floor`, are ignored — they are not
+/// this envelope's own unexplained signal. Returns `0.0` when the anchor peak is absent or degenerate.
+#[allow(clippy::too_many_arguments)]
+fn max_intervening_fraction(
+    mz: &[f64],
+    intensity: &[f64],
+    anchor_mz: f64,
+    z_hi: i32,
+    z_lo: i32,
+    mono_mass: f64,
+    tol_ppm: f64,
+    noise_floor: f64,
+    excluded: &[f64],
+    excl_ppm: f64,
+) -> f64 {
+    if z_lo == 0 || z_hi == 0 || z_lo.abs() >= z_hi.abs() || z_hi.abs() % z_lo.abs() != 0 {
+        return 0.0;
+    }
+    let anchor_int = match nearest_within_ppm(mz, intensity, anchor_mz, tol_ppm) {
+        Some(v) if v > 0.0 => v,
+        _ => return 0.0,
+    };
+    let template =
+        averagine_intensities_from_mono(mono_mass, TEMPLATE_MIN_WEIGHT, TEMPLATE_MAX_ISOTOPES);
+    if template.is_empty() {
+        return 0.0;
+    }
+    let mode_w = template[argmax(&template)];
+    if mode_w <= 0.0 {
+        return 0.0;
+    }
+    // Last significant z_lo tooth (>= 0.2 of the mode) bounds how far the intervening scan reaches.
+    let kmax_lo = template
+        .iter()
+        .enumerate()
+        .filter(|(_, &w)| w / mode_w >= 0.2)
+        .map(|(k, _)| k)
+        .max()
+        .unwrap_or(0) as i32;
+    let ratio = z_hi.abs() / z_lo.abs();
+    let mono_mz = mono_mass / z_lo.abs() as f64 + PROTON_MASS;
+    let spacing_hi = C13_MINUS_C12 / z_hi.abs() as f64;
+    let jmax = (kmax_lo + 1) * ratio;
+    let mut max_frac = 0.0f64;
+    for j in 1..=jmax {
+        if j % ratio == 0 {
+            continue; // a z_lo tooth — z_lo already predicts it, so it is not intervening
+        }
+        let target = mono_mz + j as f64 * spacing_hi;
+        if !excluded.is_empty() && near_any(target, excluded, excl_ppm) {
+            continue; // neighbour-owned position — not this envelope's own unexplained signal
+        }
+        if let Some(o) = nearest_within_ppm(mz, intensity, target, tol_ppm) {
+            if o > noise_floor {
+                max_frac = max_frac.max(o / anchor_int);
+            }
+        }
+    }
+    max_frac
+}
+
 /// Chooses the charge from `candidates` whose shift-placed envelope best fits the slice by
 /// [`envelope_fit_cosine`]. Each candidate charge is placed with [`shift_decon`] anchored on
 /// `anchor_mz`, then scored. Returns `(charge, monoisotopic_mass, cosine)` of the best, or `None` if
@@ -629,7 +718,22 @@ pub fn best_charge_by_fit(
     // sodium adduct), whereas a genuine re-charge fits cleanly (~0.98 on the light z=2 class). Without
     // the floor, a large but low-quality margin flips the correct charge.
     if let Some(pref) = evals.iter().copied().find(|e| e.0 == prefer_charge) {
-        if best.2 <= pref.2 + prefer_margin || best.2 < RECHARGE_MIN_FIT {
+        let mut keep_pref = best.2 <= pref.2 + prefer_margin || best.2 < RECHARGE_MIN_FIT;
+        // Anti-halving guard: if the winner HALVES the detector charge (a proper divisor of
+        // prefer_charge) yet strong observed signal sits on the intervening finer-grid teeth it
+        // cannot predict, its higher cosine is an artefact of ignoring real signal — keep the
+        // detector charge. This is the direction opposite the light-z2 doubling recovery (best > pref),
+        // which is left untouched. Traced on DSCQGDSGGPVVCSGK — see RECHARGE_HALVING_MAX_INTERVENING.
+        if !keep_pref && best.0.abs() < prefer_charge.abs() && prefer_charge.abs() % best.0.abs() == 0 {
+            let frac = max_intervening_fraction(
+                mz, intensity, anchor_mz, prefer_charge, best.0, best.1, tol_ppm, noise_floor,
+                excluded, excl_ppm,
+            );
+            if frac > RECHARGE_HALVING_MAX_INTERVENING {
+                keep_pref = true;
+            }
+        }
+        if keep_pref {
             return Some(pref);
         }
     }
@@ -875,6 +979,76 @@ mod tests {
                 .expect("charge");
         assert_eq!(z, 2, "a clean z=2 fit must override a wrong z=1 detector label");
         assert!(cos >= RECHARGE_MIN_FIT, "the winning z=2 fit {cos} should clear the floor");
+    }
+
+    #[test]
+    fn intervening_fraction_flags_present_and_ignores_absent() {
+        // z_hi=2 (detector) vs z_lo=1 (halving candidate). A z=1 envelope (mono is the mode) plus a
+        // strong peak on the intervening z=2 (odd, half-Th) position should be flagged; a clean z=1
+        // envelope with NO intervening peak (a genuine halving) must read ~0.
+        let z1_mono = 804.3327;
+        let mono_mz = mass_to_mz_f64(z1_mono, 1);
+        let sp1 = C13_MINUS_C12;
+        let sp2 = C13_MINUS_C12 / 2.0;
+        // z1 teeth: anchor (mono) tallest.
+        let base = vec![
+            (mono_mz, 3.5e6),
+            (mono_mz + sp1, 1.5e6),
+            (mono_mz + 2.0 * sp1, 0.5e6),
+        ];
+
+        // Present: add an intervening peak at 0.6 of the anchor.
+        let mut with = base.clone();
+        with.push((mono_mz + sp2, 2.1e6));
+        with.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let wm: Vec<f64> = with.iter().map(|p| p.0).collect();
+        let wi: Vec<f64> = with.iter().map(|p| p.1).collect();
+        let f = max_intervening_fraction(&wm, &wi, mono_mz, 2, 1, z1_mono, 20.0, 0.0, &[], 0.0);
+        assert!(
+            f > RECHARGE_HALVING_MAX_INTERVENING,
+            "present intervening peak should exceed the floor, got {f}"
+        );
+
+        // Absent: a genuine z=1 envelope has empty intervening positions → fraction ~0.
+        let am: Vec<f64> = base.iter().map(|p| p.0).collect();
+        let ai: Vec<f64> = base.iter().map(|p| p.1).collect();
+        let f0 = max_intervening_fraction(&am, &ai, mono_mz, 2, 1, z1_mono, 20.0, 0.0, &[], 0.0);
+        assert!(
+            f0 <= RECHARGE_HALVING_MAX_INTERVENING,
+            "no intervening peak → fraction ~0, got {f0}"
+        );
+    }
+
+    #[test]
+    fn best_charge_rejects_spurious_halving_with_intervening_signal() {
+        // DSCQGDSGGPVVCSGK-shaped case: detector z=2, observed envelope MONO-TALLEST with strong
+        // signal on the intervening (odd) z=2 teeth. The z=1 comb fits its own (even) teeth well and
+        // skips the intervening peaks, which without the anti-halving guard let it out-score z=2 and
+        // halve the mass to ~804. The guard sees the intervening signal and keeps the detector's z=2.
+        let z1_mono = 804.3327;
+        let mono_mz = mass_to_mz_f64(z1_mono, 1); // == z2 mono m/z (805.34)
+        let sp1 = C13_MINUS_C12;
+        let sp2 = C13_MINUS_C12 / 2.0;
+        // z1-shaped even teeth (so z=1 fits them cleanly), plus strong intervening odd teeth.
+        let tmpl1 = crate::deconvolution::averagine_intensities_from_mono(z1_mono, 1e-3, 20);
+        let mut peaks: Vec<(f64, f64)> = tmpl1
+            .iter()
+            .enumerate()
+            .take(4)
+            .map(|(k, &w)| (mono_mz + k as f64 * sp1, w * 1.0e7))
+            .collect();
+        let anchor_int = peaks[0].1;
+        peaks.push((mono_mz + sp2, 0.6 * anchor_int)); // intervening between k0 and k1
+        peaks.push((mono_mz + 3.0 * sp2, 0.25 * anchor_int)); // intervening between k1 and k2
+        peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mz: Vec<f64> = peaks.iter().map(|p| p.0).collect();
+        let inten: Vec<f64> = peaks.iter().map(|p| p.1).collect();
+
+        let (z, _mass, _cos) = best_charge_by_fit(
+            &mz, &inten, mono_mz, &[1, 2, 4], 20.0, 0.0, 2, RECHARGE_PREFER_MARGIN, &[], 0.0,
+        )
+        .expect("charge");
+        assert_eq!(z, 2, "strong intervening signal must block the spurious halving to z=1");
     }
 
     #[test]
