@@ -1141,21 +1141,26 @@ fn resolve_group(members: Vec<RefinedFeature>, mass_tolerance_ppm: f64) -> Resol
     }
 }
 
-/// A single pooled candidate mass tagged with its source charge and contributing intensity weight.
+/// A single pooled candidate mass tagged with its source charge, an intensity weight (for the
+/// weighted-mean mass) and the source feature's envelope-fit `decon_score` (for the ranking tiebreak).
 struct Candidate {
     mass: f64,
     charge: i32,
     weight: f64,
+    fit: f64,
 }
 
 /// Pools every member's candidate masses, clusters them within `mass_tolerance_ppm` (0.01 Da floor),
-/// and returns the (weighted-mean mass, cross-charge support) of the cluster with the greatest
-/// cross-charge support (ties: candidate count, then summed weight). Returns the tallest member's
-/// refined mass if there are no candidates to cluster.
+/// and returns the (weighted-mean mass, cross-charge support) of the best cluster, ranked by
+/// distinct-charge support, then candidate count, then **best envelope fit**, then summed intensity.
 ///
-/// (A fit-weighted variant — ranking clusters by summed per-charge `decon_score` instead of raw
-/// distinct-charge count, to stop off-by-one siblings out-voting a single correct placement — was
-/// tried and regressed CA/Lumos recall, so support stays a plain distinct-charge count.)
+/// The fit tiebreak matters when two mass clusters tie on charge support — e.g. one peptide detected at
+/// z=1 and z=2 whose z=1 envelope is contaminated by co-eluting interferents (refine mis-places its
+/// mono, low `decon_score`) while its z=2 envelope is clean (correct mono, high score). Both are lone
+/// singletons (support 1), so the earlier intensity-only tiebreak handed the mass to the *stronger* z=1
+/// even though its placement is wrong; ranking the better-fitting placement first picks the clean z=2.
+/// Support stays the **primary** key (a genuine multi-charge agreement must still outrank a lone
+/// high-fit placement — making summed fit the primary key instead regressed recall).
 fn resolve_mass_by_cross_charge(
     members: &[RefinedFeature],
     mass_tolerance_ppm: f64,
@@ -1168,11 +1173,17 @@ fn resolve_mass_by_cross_charge(
         } else {
             1.0
         };
+        let fit = if m.decon_score.is_finite() {
+            m.decon_score.max(0.0)
+        } else {
+            0.0
+        };
         for &mass in &m.candidate_masses {
             candidates.push(Candidate {
                 mass,
                 charge: m.refined_charge,
                 weight: w,
+                fit,
             });
         }
     }
@@ -1209,8 +1220,8 @@ fn resolve_mass_by_cross_charge(
     }
     clusters.push(current);
 
-    // Score each cluster: (distinct charges, count, summed weight); pick the best.
-    let mut best: Option<(usize, usize, f64, f64)> = None; // (support, count, sum_w, weighted_mass)
+    // Score each cluster; pick the best. Tuple: (support, count, max_fit, sum_w, weighted_mass).
+    let mut best: Option<(usize, usize, f64, f64, f64)> = None;
     for cluster in &clusters {
         let mut charges: Vec<i32> = cluster.iter().map(|&i| candidates[i].charge).collect();
         charges.sort_unstable();
@@ -1218,6 +1229,11 @@ fn resolve_mass_by_cross_charge(
         let support = charges.len();
         let count = cluster.len();
         let sum_w: f64 = cluster.iter().map(|&i| candidates[i].weight).sum();
+        // Best envelope fit in this cluster — the tiebreak when support and count are equal.
+        let max_fit: f64 = cluster
+            .iter()
+            .map(|&i| candidates[i].fit)
+            .fold(0.0_f64, f64::max);
         let weighted_mass = if sum_w > 0.0 {
             cluster
                 .iter()
@@ -1227,20 +1243,25 @@ fn resolve_mass_by_cross_charge(
         } else {
             cluster.iter().map(|&i| candidates[i].mass).sum::<f64>() / count as f64
         };
+        // (support, count, max_fit, sum_w): support primary, then count, then best fit, then intensity.
         let better = match &best {
             None => true,
-            Some((bs, bc, bw, _)) => {
+            Some((bs, bc, bf, bw, _)) => {
                 support > *bs
                     || (support == *bs && count > *bc)
-                    || (support == *bs && count == *bc && sum_w > *bw)
+                    || (support == *bs && count == *bc && max_fit > *bf + 1e-9)
+                    || (support == *bs
+                        && count == *bc
+                        && (max_fit - *bf).abs() <= 1e-9
+                        && sum_w > *bw)
             }
         };
         if better {
-            best = Some((support, count, sum_w, weighted_mass));
+            best = Some((support, count, max_fit, sum_w, weighted_mass));
         }
     }
 
-    let (support, _, _, mass) = best.expect("at least one cluster exists");
+    let (support, _, _, _, mass) = best.expect("at least one cluster exists");
     (mass, support)
 }
 
@@ -1443,6 +1464,29 @@ mod tests {
         let b = make_refined(3, off, vec![off, true_mass], 20.03, 3.0e6); // window [19.83, 20.23]
         let resolved = resolve_charge_state_consensus(&[a, b], 15.0, 0.1);
         assert_eq!(resolved.len(), 1, "co-eluting off-by-one charges should knit into one feature");
+    }
+
+    #[test]
+    fn consensus_tiebreak_prefers_better_fit_over_intensity() {
+        // AAVTAFWGK scenario: the peptide is seen at z=1 (envelope contaminated by co-eluting
+        // interferents, so refine mis-places its mono +1 -> low fit) and z=2 (clean -> correct mono,
+        // high fit). The z=1 is the STRONGER peak. Both are lone singletons (support 1), so the mass
+        // vote is a tiebreak: it must take the better-fitting z=2 placement, not the intense z=1 +1.
+        let true_mass = 992.5174;
+        let z1_wrong = true_mass + C13_MINUS_C12;
+        let mut z1 = make_refined(1, z1_wrong, vec![z1_wrong], 16.309, 9.4e7);
+        z1.decon_score = 0.39; // contaminated envelope, poor fit
+        let mut z2 = make_refined(2, true_mass, vec![true_mass], 16.310, 6.5e7);
+        z2.decon_score = 0.99; // clean envelope
+        let resolved = resolve_charge_state_consensus(&[z1, z2], 10.0, 0.1);
+        assert_eq!(resolved.len(), 1, "same peptide at z1/z2 should knit into one feature");
+        let r = &resolved[0];
+        assert!(
+            ppm_of(r.monoisotopic_mass, true_mass) <= 5.0,
+            "consensus should take the better-fitting z=2 mass {} not the more intense z=1 +1 (got {})",
+            true_mass,
+            r.monoisotopic_mass
+        );
     }
 
     #[test]
