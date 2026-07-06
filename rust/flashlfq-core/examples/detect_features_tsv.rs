@@ -266,17 +266,24 @@ fn main() {
 
     // REFINE_METHOD selects the deconvolution used to place the refined monoisotope:
     //   classic (default) | shift_composite | shift_apex  (detector-anchored FlashLFQ-style shift).
-    let refine_method = std::env::var("REFINE_METHOD").unwrap_or_else(|_| "classic".to_string());
+    // Default: the detector-anchored shift decon on the apex scan (REFINE_METHOD=classic to opt out
+    // back to the parity-locked classic deconvolution; shift_composite selects the averaged composite).
+    let refine_method = std::env::var("REFINE_METHOD").unwrap_or_else(|_| "shift_apex".to_string());
     let use_shift_apex = refine_method == "shift_apex";
     let use_shift = use_shift_apex || refine_method == "shift_composite";
-    eprintln!("  refine method: {refine_method}");
+    // Charge re-selection by the envelope-fit cosine (fit + explained + completeness) defaults ON for
+    // the shift methods; disable with RECHARGE=0. Recovers charge-halved features (the light-z2 class).
+    let recharge = std::env::var("RECHARGE")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    eprintln!("  refine method: {refine_method}{}", if recharge && use_shift { " + recharge (envelope-fit cosine)" } else { "" });
 
     let t2 = Instant::now();
     let mut refined: Vec<RefinedFeature> = Vec::with_capacity(detected.len());
     let progress_every = 1000usize;
     for (i, f) in detected.iter().enumerate() {
         let r = if use_shift {
-            refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex)
+            refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge)
         } else if censor_claimed {
             refine_feature_censored(f, &scans, &avg, &decon, &all_claimed)
         } else {
@@ -403,7 +410,7 @@ fn run_refine_diff(
         if refine_feature(f, scans, avg, decon).is_some() {
             continue;
         }
-        if let Some(r) = refine_feature_shift(f, scans, avg, 20.0, true) {
+        if let Some(r) = refine_feature_shift(f, scans, avg, 20.0, true, false) {
             n_gain += 1;
             let pk = f
                 .peaks

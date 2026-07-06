@@ -7,11 +7,12 @@ the explorer separate "off-by-one remainders" from "truly missing" peptides.
 
 Columns feed examples/obo_envelope_probe.rs (OBO_TARGETS=...). Data paths per lumos-test-data-paths.
 """
-import csv, bisect, os, re
+import csv, bisect, os, re, sys
 
-FEAT = r"D:\SP_Tutorial\Lumos\untargeted_cov90_shiftapex.tsv"  # best method's resolved features
+# Resolved-features file (best method) as argv[1]; default = cov90 shift-apex.
+FEAT = sys.argv[1] if len(sys.argv) > 1 else r"D:\SP_Tutorial\Lumos\untargeted_cov90_shiftapex.tsv"
 REF = r"D:\SP_Tutorial\Lumos\CA_HCD_GPTMD_Search_WideTol\Task2-SearchTask\AllQuantifiedPeaks.tsv"
-OUTDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "misses")
+OUTDIR = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "misses")
 OUT = os.path.join(OUTDIR, "miss_targets.tsv")
 C13 = 1.00335483810
 MASS_PPM, RT_MIN = 20.0, 0.3

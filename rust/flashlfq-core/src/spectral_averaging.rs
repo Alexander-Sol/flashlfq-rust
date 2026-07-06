@@ -9,16 +9,16 @@
 //!
 //! ## Scope (default-config subset)
 //! mzLib's full project supports several outlier-rejection algorithms, several weighting schemes,
-//! and file-level scan windowing. This port covers the **default** configuration faithfully and
-//! stubs the rest, per the design decision to "port binning + the default rejection/weighting
-//! config faithfully (golden-gated), stub the alternate rejection algorithms until needed":
+//! and file-level scan windowing. This port covers the configuration the pipeline uses faithfully
+//! (m/z binning, even/TIC weighting, all normalization variants, and both `NoRejection` and
+//! `SigmaClipping`), and stubs the remaining rejection/weighting algorithms until needed:
 //!
 //! | Knob | mzLib default | Ported here |
 //! |------|---------------|-------------|
 //! | `SpectralAveragingType` | `MzBinning` (only variant) | ✅ full |
 //! | `NormalizationType` | `RelativeToTics` | ✅ all four variants (trivial) |
 //! | `SpectraWeightingType` | `WeightEvenly` | ✅ `WeightEvenly` + `TicValue`; `MrsNoiseEstimation` panics |
-//! | `OutlierRejectionType` | `NoRejection` | ✅ `NoRejection`; the six clipping variants panic |
+//! | `OutlierRejectionType` | `NoRejection` | ✅ `NoRejection` + `SigmaClipping`; other clipping variants panic |
 //! | `BinSize` | `0.01` | ✅ |
 //!
 //! The file-level windowing (`SpectraFileAveraging`, `AverageEverynScansWithOverlap`, scan overlap,
@@ -29,13 +29,16 @@
 //! Control flow, summation order, the `floor((x - minX) / binSize)` bin index, and the "divide the
 //! bin's summed intensity by the *spectrum* count (not the present-peak count)" behaviour are
 //! preserved so a future C# golden matches at the standard tolerance (counts exact, floats
-//! rel-1e-6). The one deliberate departure is performance-motivated: mzLib pads every bin with a
-//! zero-intensity peak for each spectrum that did not contribute a real peak, then averages over
-//! the padded set. That padding is algebraically inert — a zero peak adds nothing to the weighted
-//! numerator and sits at the running m/z mean — so this port elides it and folds its only real
-//! effect (dividing by the full spectrum count, via the summed weight) into the averaging
-//! denominator directly (see [`average_bin`]). Results are identical up to floating-point
-//! summation order, well within the rel-1e-6 tolerance. Where mzLib mutates the caller's `yArrays`
+//! rel-1e-6). The one deliberate departure is performance-motivated and applies **only to the
+//! `NoRejection` path**: mzLib pads every bin with a zero-intensity peak for each spectrum that did
+//! not contribute a real peak, then averages over the padded set. When nothing is rejected that
+//! padding is algebraically inert — a zero peak adds nothing to the weighted numerator and sits at
+//! the running m/z mean — so [`average_bin`] elides it and folds its only real effect (dividing by
+//! the full spectrum count, via the summed weight) into the averaging denominator directly. Under
+//! outlier rejection the padding is *not* inert (absent-spectrum zeros participate in the clip
+//! statistics and shift the surviving-weight denominator), so [`average_bin_rejected`] materializes
+//! it explicitly. Results are identical up to floating-point summation order, well within the
+//! rel-1e-6 tolerance. Where mzLib mutates the caller's `yArrays`
 //! in place during normalization, this port normalizes an internal clone instead — the arithmetic
 //! is identical; only the (undesirable) side effect on the caller is dropped.
 
@@ -43,9 +46,9 @@
 // Configuration enums (mirroring SpectralAveraging/DataStructures/Enums)
 // ---------------------------------------------------------------------------
 
-/// `SpectralAveraging.OutlierRejectionType`. Only [`OutlierRejectionType::NoRejection`] is ported;
-/// the clipping variants are carried for config/parity completeness but panic if dispatched
-/// (see module scope).
+/// `SpectralAveraging.OutlierRejectionType`. [`OutlierRejectionType::NoRejection`] and
+/// [`OutlierRejectionType::SigmaClipping`] are ported; the remaining clipping variants are carried
+/// for config/parity completeness but panic if dispatched (see module scope).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutlierRejectionType {
     NoRejection,
@@ -90,7 +93,7 @@ pub enum SpectralAveragingType {
 /// windowing fields (`SpectraFileAveragingType`, `NumberOfScansToAverage`, `ScanOverlap`,
 /// `OutputType`, `MaxThreadsToUsePerFile`) are intentionally omitted — feature detection supplies
 /// its own scan window. `MinSigmaValue`/`MaxSigmaValue`/`Percentile` are carried so the struct can
-/// still describe the (currently panicking) clipping configs without changing shape later.
+/// carry the sigma-clipping bounds (and the not-yet-ported `Percentile`) without changing shape.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpectralAveragingParameters {
     pub outlier_rejection_type: OutlierRejectionType,
@@ -104,18 +107,23 @@ pub struct SpectralAveragingParameters {
 }
 
 impl Default for SpectralAveragingParameters {
-    /// Mirrors `SpectralAveragingParameters.SetDefaultValues()` (averaging-relevant fields only):
-    /// `NoRejection`, `WeightEvenly`, `MzBinning`, `RelativeToTics`, bin size `0.01`.
+    /// FlashLFQ's configured averaging standard. This mirrors `SpectralAveragingParameters
+    /// .SetDefaultValues()` for weighting (`WeightEvenly`), averaging (`MzBinning`), normalization
+    /// (`RelativeToTics`) and bin size (`0.01`), but **deliberately deviates on outlier rejection**:
+    /// mzLib's `SetDefaultValues()` uses `NoRejection`, whereas the pipeline runs
+    /// [`OutlierRejectionType::SigmaClipping`] with min/max σ `0.5`/`3.0`. The asymmetric bounds
+    /// clip the low tail of each bin (dropouts and absent-spectrum zeros) aggressively while leaving
+    /// real high-intensity signal essentially untouched, which sharpens the averaged composite.
     fn default() -> Self {
         SpectralAveragingParameters {
-            outlier_rejection_type: OutlierRejectionType::NoRejection,
+            outlier_rejection_type: OutlierRejectionType::SigmaClipping,
             spectral_weighting_type: SpectraWeightingType::WeightEvenly,
             spectral_averaging_type: SpectralAveragingType::MzBinning,
             normalization_type: NormalizationType::RelativeToTics,
             bin_size: 0.01,
             percentile: 0.1,
-            min_sigma_value: 1.5,
-            max_sigma_value: 1.5,
+            min_sigma_value: 0.5,
+            max_sigma_value: 3.0,
         }
     }
 }
@@ -174,18 +182,6 @@ fn mz_binning(
         assert_eq!(x.len(), y.len(), "each spectrum's x and y arrays must match in length");
     }
 
-    // Only NoRejection is ported. Dispatch up front so the clipping stubs still panic: their
-    // per-peak semantics operate on the zero-padded bins that this fast path deliberately elides,
-    // so they cannot share it. (See module scope.)
-    match parameters.outlier_rejection_type {
-        OutlierRejectionType::NoRejection => {}
-        other => unimplemented!(
-            "outlier rejection {:?} is outside the default-config subset; only NoRejection is \
-             ported (see module scope)",
-            other
-        ),
-    }
-
     // normalize spectra — mzLib mutates the caller's arrays here; we normalize an internal clone
     // (and skip even that allocation when there is nothing to normalize).
     let mut owned;
@@ -198,18 +194,28 @@ fn mz_binning(
         }
     };
 
-    // get bins (real peaks only; the zero padding is folded into average_bin below)
+    // get bins (real peaks only; the zero padding is re-derived per bin where it matters — folded
+    // into average_bin for NoRejection, materialized in average_bin_rejected otherwise)
     let bins = get_bins(x_arrays, y_norm, parameters.bin_size);
 
-    // get weights. The averaging denominator is the summed weight over *all* spectra — this is the
-    // padding's only real effect, hoisted out of the per-bin loop since it is bin-independent.
+    // get weights. For NoRejection the averaging denominator is the summed weight over *all* spectra
+    // (the padding's only effect), hoisted out of the per-bin loop since it is bin-independent; the
+    // rejection path instead sums the weights of the surviving peaks per bin.
     let weights = calculate_spectra_weights(x_arrays, y_norm, parameters.spectral_weighting_type);
     let total_weight = sum(&weights);
 
-    // average bins
+    // reject outliers and average bins. NoRejection keeps the padding-free fast path (average_bin);
+    // every other config must materialize the zero padding and reject over it (average_bin_rejected),
+    // because the rejection statistics and the surviving-weight denominator both depend on the
+    // padded set — the algebraic shortcut only holds when nothing is rejected.
+    let num_spectra = x_arrays.len();
     let mut averaged_peaks: Vec<(f64, f64)> = Vec::with_capacity(bins.len());
     for peaks_from_bin in &bins {
-        averaged_peaks.push(average_bin(peaks_from_bin, &weights, total_weight));
+        let averaged = match parameters.outlier_rejection_type {
+            OutlierRejectionType::NoRejection => average_bin(peaks_from_bin, &weights, total_weight),
+            _ => average_bin_rejected(peaks_from_bin, &weights, num_spectra, parameters),
+        };
+        averaged_peaks.push(averaged);
     }
 
     // return averaged: drop zero-intensity bins, order by m/z; AbsoluteToTic re-scales by averageTic
@@ -288,6 +294,136 @@ fn average_bin(real_peaks: &[BinnedPeak], weights: &[f64], total_weight: f64) ->
     let mz = mz_sum / real_peaks.len() as f64;
     let intensity = numerator / total_weight;
     (mz, intensity)
+}
+
+/// `SpectraAveraging.AverageBin` composed with `OutlierRejection.RejectOutliers`, for every config
+/// other than `NoRejection`. Unlike [`average_bin`], the zero-intensity padding cannot be elided:
+/// mzLib rejects outliers over the *padded* peak set (so an absent spectrum's zero participates in
+/// the median/σ statistics and can itself be clipped), and averages the survivors with *their*
+/// summed weight as the denominator, not the weight over all spectra. So we materialize the padding
+/// (mzLib does this in `GetBins`), reject, then weight-average whatever remains.
+///
+/// Returns `(0.0, 0.0)` when every peak is rejected; the caller drops zero-intensity bins, matching
+/// mzLib's `if (!peaksFromBin.Any()) continue;`.
+fn average_bin_rejected(
+    real_peaks: &[BinnedPeak],
+    weights: &[f64],
+    num_spectra: usize,
+    parameters: &SpectralAveragingParameters,
+) -> (f64, f64) {
+    // Materialize mzLib's zero padding: each spectrum with no real peak in this bin contributes a
+    // zero-intensity peak at the bin's mean real m/z (mzLib pads at the running m/z mean, which is
+    // that same value since each padded peak sits exactly on it).
+    let mz_mean = real_peaks.iter().map(|p| p.mz).sum::<f64>() / real_peaks.len() as f64;
+    let mut padded: Vec<BinnedPeak> = real_peaks.to_vec();
+    let mut present = vec![false; num_spectra];
+    for peak in real_peaks {
+        present[peak.spectra_id] = true;
+    }
+    for (id, &seen) in present.iter().enumerate() {
+        if !seen {
+            padded.push(BinnedPeak {
+                mz: mz_mean,
+                intensity: 0.0,
+                spectra_id: id,
+            });
+        }
+    }
+
+    let survivors = reject_outliers(padded, parameters);
+    if survivors.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    let mut mz_sum = 0.0;
+    for peak in &survivors {
+        numerator += peak.intensity * weights[peak.spectra_id];
+        denominator += weights[peak.spectra_id];
+        mz_sum += peak.mz;
+    }
+    (mz_sum / survivors.len() as f64, numerator / denominator)
+}
+
+/// Port of `OutlierRejection.RejectOutliers(List<BinnedPeak>, …)`: run the configured rejection over
+/// the peaks' intensities, then keep the peaks whose intensity survived. Membership is by intensity
+/// value, mirroring the C# overload; this is exact because sigma clipping never splits equal values
+/// (identical intensities share the same clip predicate, so they are kept or dropped together).
+fn reject_outliers(
+    peaks: Vec<BinnedPeak>,
+    parameters: &SpectralAveragingParameters,
+) -> Vec<BinnedPeak> {
+    let survivors = match parameters.outlier_rejection_type {
+        OutlierRejectionType::NoRejection => return peaks,
+        OutlierRejectionType::SigmaClipping => sigma_clipping(
+            peaks.iter().map(|p| p.intensity).collect(),
+            parameters.min_sigma_value,
+            parameters.max_sigma_value,
+        ),
+        other => unimplemented!(
+            "outlier rejection {:?} is outside the ported subset; only NoRejection and \
+             SigmaClipping are ported (see module scope)",
+            other
+        ),
+    };
+    peaks
+        .into_iter()
+        .filter(|p| survivors.contains(&p.intensity))
+        .collect()
+}
+
+/// Port of `OutlierRejection.SigmaClipping`: iteratively drop values lying more than `s_min` σ below
+/// or `s_max` σ above the current median, recomputing the median and (sample) σ each pass, until a
+/// pass rejects nothing. The two bounds are asymmetric by design — feature detection clips the low
+/// tail (dropouts, absent-spectrum zeros) aggressively while keeping the high tail (real signal).
+fn sigma_clipping(mut values: Vec<f64>, s_min: f64, s_max: f64) -> Vec<f64> {
+    loop {
+        let med = median(&values);
+        let std_dev = sample_standard_deviation(&values);
+        let before = values.len();
+        values.retain(|&v| !should_clip(v, med, std_dev, s_min, s_max));
+        if values.len() == before {
+            break;
+        }
+    }
+    values
+}
+
+/// mzLib's `SigmaClipping` per-value predicate: reject `value` when it is more than `s_min` σ below
+/// the median or more than `s_max` σ above it. When σ is zero or NaN (constant or singleton input)
+/// the comparisons evaluate false, so nothing is rejected — matching C# `double` semantics and
+/// letting [`sigma_clipping`] terminate.
+fn should_clip(value: f64, median: f64, std_dev: f64, s_min: f64, s_max: f64) -> bool {
+    (median - value) / std_dev > s_min || (value - median) / std_dev > s_max
+}
+
+/// Sample median (`MathNet.Numerics.Statistics.Median`): the central order statistic, averaging the
+/// two central values for even length. Returns NaN for empty input.
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
+/// Sample standard deviation (`MathNet.Numerics.Statistics.StandardDeviation`, Bessel-corrected,
+/// dividing by `n - 1`). Returns NaN for fewer than two values, matching MathNet.
+fn sample_standard_deviation(values: &[f64]) -> f64 {
+    let n = values.len();
+    if n < 2 {
+        return f64::NAN;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let sum_sq: f64 = values.iter().map(|&v| (v - mean) * (v - mean)).sum();
+    (sum_sq / (n as f64 - 1.0)).sqrt()
 }
 
 // ---------------------------------------------------------------------------
@@ -400,9 +536,13 @@ mod tests {
     /// bin m/z = mean(100.00, 100.005) = 100.0025.
     #[test]
     fn two_spectra_single_shared_bin() {
+        let params = SpectralAveragingParameters {
+            outlier_rejection_type: OutlierRejectionType::NoRejection,
+            ..SpectralAveragingParameters::default()
+        };
         let x = vec![vec![100.000], vec![100.005]];
         let y = vec![vec![10.0], vec![20.0]];
-        let (mz, inten) = average_spectra(&x, &y, &SpectralAveragingParameters::default());
+        let (mz, inten) = average_spectra(&x, &y, &params);
         assert_eq!(mz.len(), 1);
         approx(mz[0], 100.0025);
         approx(inten[0], 15.0);
@@ -414,9 +554,13 @@ mod tests {
     /// Normalized A=[7.5,22.5], B=[30]. Bin100: (7.5+30)/2=18.75. Bin200: (22.5+0)/2=11.25.
     #[test]
     fn padding_divides_by_spectrum_count() {
+        let params = SpectralAveragingParameters {
+            outlier_rejection_type: OutlierRejectionType::NoRejection,
+            ..SpectralAveragingParameters::default()
+        };
         let x = vec![vec![100.000, 200.000], vec![100.000]];
         let y = vec![vec![10.0, 30.0], vec![20.0]];
-        let (mz, inten) = average_spectra(&x, &y, &SpectralAveragingParameters::default());
+        let (mz, inten) = average_spectra(&x, &y, &params);
         assert_eq!(mz.len(), 2);
         approx(mz[0], 100.0);
         approx(inten[0], 18.75);
@@ -430,6 +574,7 @@ mod tests {
     fn no_normalization_single_spectrum_passthrough() {
         let params = SpectralAveragingParameters {
             normalization_type: NormalizationType::NoNormalization,
+            outlier_rejection_type: OutlierRejectionType::NoRejection,
             ..SpectralAveragingParameters::default()
         };
         let x = vec![vec![300.0, 100.0, 200.0]];
@@ -444,6 +589,7 @@ mod tests {
     fn zero_intensity_bins_dropped() {
         let params = SpectralAveragingParameters {
             normalization_type: NormalizationType::NoNormalization,
+            outlier_rejection_type: OutlierRejectionType::NoRejection,
             ..SpectralAveragingParameters::default()
         };
         let x = vec![vec![100.0, 200.0]];
@@ -461,6 +607,7 @@ mod tests {
         let params = SpectralAveragingParameters {
             normalization_type: NormalizationType::NoNormalization,
             spectral_weighting_type: SpectraWeightingType::TicValue,
+            outlier_rejection_type: OutlierRejectionType::NoRejection,
             ..SpectralAveragingParameters::default()
         };
         let x = vec![vec![100.000], vec![100.005]];
@@ -470,15 +617,82 @@ mod tests {
         approx(inten[0], 25.0 / 1.5);
     }
 
+    /// `sigma_clipping` iteratively drops a low outlier. [10,10,10,10,2] at min σ 0.5: the 2 lies
+    /// ~2.24 σ below the median (10) so it is rejected; the remaining values are identical (σ = 0),
+    /// so the next pass rejects nothing and the loop terminates.
     #[test]
-    #[should_panic(expected = "outside the default-config subset")]
-    fn sigma_clipping_panics_as_stub() {
-        let params = SpectralAveragingParameters {
-            outlier_rejection_type: OutlierRejectionType::SigmaClipping,
+    fn sigma_clipping_drops_low_outlier() {
+        let survivors = sigma_clipping(vec![10.0, 10.0, 10.0, 10.0, 2.0], 0.5, 3.0);
+        assert_eq!(survivors, vec![10.0, 10.0, 10.0, 10.0]);
+    }
+
+    /// The min/max bounds are asymmetric: with min σ 0.5 / max σ 3.0 on [5,10,10,10,15] (median 10,
+    /// σ ≈ 3.54), the low value 5 is ~1.41 σ below the median and is rejected, while the equally
+    /// distant high value 15 is only ~1.41 σ above (< 3) and is kept.
+    #[test]
+    fn sigma_clipping_bounds_are_asymmetric() {
+        let survivors = sigma_clipping(vec![5.0, 10.0, 10.0, 10.0, 15.0], 0.5, 3.0);
+        assert_eq!(survivors, vec![10.0, 10.0, 10.0, 15.0]);
+    }
+
+    /// Constant and singleton inputs have σ = 0 / NaN, so nothing is rejected and the loop halts.
+    #[test]
+    fn sigma_clipping_terminates_on_degenerate_input() {
+        assert_eq!(sigma_clipping(vec![7.0, 7.0, 7.0], 0.5, 3.0), vec![7.0, 7.0, 7.0]);
+        assert_eq!(sigma_clipping(vec![7.0], 0.5, 3.0), vec![7.0]);
+    }
+
+    /// End-to-end: five spectra sharing one bin with intensities [10,10,10,10,2]. Under the default
+    /// sigma-clipping config the low 2 is clipped, so the composite intensity is the mean of the
+    /// four survivors (10.0); with `NoRejection` it would be (40 + 2) / 5 = 8.4.
+    #[test]
+    fn sigma_clipping_end_to_end_clips_bin() {
+        let x = vec![vec![100.0]; 5];
+        let y = vec![vec![10.0], vec![10.0], vec![10.0], vec![10.0], vec![2.0]];
+
+        let sigma = SpectralAveragingParameters {
+            normalization_type: NormalizationType::NoNormalization,
             ..SpectralAveragingParameters::default()
         };
-        let x = vec![vec![100.0], vec![100.0]];
-        let y = vec![vec![10.0], vec![20.0]];
-        let _ = average_spectra(&x, &y, &params);
+        let (mz, inten) = average_spectra(&x, &y, &sigma);
+        assert_eq!(mz.len(), 1);
+        approx(mz[0], 100.0);
+        approx(inten[0], 10.0);
+
+        let no_reject = SpectralAveragingParameters {
+            normalization_type: NormalizationType::NoNormalization,
+            outlier_rejection_type: OutlierRejectionType::NoRejection,
+            ..SpectralAveragingParameters::default()
+        };
+        let (_, inten_nr) = average_spectra(&x, &y, &no_reject);
+        approx(inten_nr[0], 8.4);
+    }
+
+    /// The zero-intensity padding for absent spectra participates in rejection. Four spectra have a
+    /// peak at 100.0 (intensity 10); a fifth contributes only at 100.5. In the 100.0 bin the fifth
+    /// spectrum's padded zero is ~2.24 σ below the median and is clipped, so the intensity is the
+    /// mean of the four real peaks (10.0) rather than 40 / 5 = 8.0. In the 100.5 bin the lone real
+    /// peak (10) sits among four zeros but only ~2.24 σ above the median (< 3 σ), so nothing is
+    /// rejected and the intensity is 10 / 5 = 2.0.
+    #[test]
+    fn sigma_clipping_rejects_zero_padding() {
+        let x = vec![
+            vec![100.0],
+            vec![100.0],
+            vec![100.0],
+            vec![100.0],
+            vec![100.5],
+        ];
+        let y = vec![vec![10.0]; 5];
+        let params = SpectralAveragingParameters {
+            normalization_type: NormalizationType::NoNormalization,
+            ..SpectralAveragingParameters::default()
+        };
+        let (mz, inten) = average_spectra(&x, &y, &params);
+        assert_eq!(mz.len(), 2);
+        approx(mz[0], 100.0);
+        approx(inten[0], 10.0);
+        approx(mz[1], 100.5);
+        approx(inten[1], 2.0);
     }
 }

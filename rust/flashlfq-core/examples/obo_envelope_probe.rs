@@ -1,7 +1,7 @@
 //! Off-by-one envelope probe — a diagnostic for the monoisotope off-by-one misses.
 //!
 //! For a handful of reference peaks the detector got off by one ¹³C unit, this pulls out:
-//!   1. the **individual per-scan envelopes** in the apex ± 3 scan window (the exact averaging
+//!   1. the **individual per-scan envelopes** in the apex ± 1 scan window (the exact averaging
 //!      window `refine_feature` uses), and
 //!   2. the **averaged composite envelope** (`average_spectra`, the same call `refine_feature` makes),
 //! then runs the parity-gated `classic_deconvolute` on every one of them and reports the monoisotopic
@@ -26,6 +26,7 @@ use flashlfq_core::deconvolution::{
     averagine_intensities_from_mono, classic_deconvolute, ClassicDeconvolutionParameters,
     DeconEnvelope, Polarity,
 };
+use flashlfq_core::feature_refinement::MAX_SCANS_TO_AVERAGE;
 use flashlfq_core::isotope_shift_decon::shift_decon_in_window;
 use flashlfq_core::isotopic_envelope::{C13_MINUS_C12, PROTON_MASS};
 use flashlfq_core::peak_indexing::{read_ms1_scans, PeakIndexingEngine};
@@ -187,17 +188,21 @@ fn shift_report(
             let corrected = t.ref_mono + k as f64 * C13_MINUS_C12;
             let ppm = (r.monoisotopic_mass - corrected) / corrected * 1e6;
             let verdict = if k == 0 { "CORRECT" } else { "OFF-BY-ONE" };
+            let corrs: String = r
+                .shifts
+                .iter()
+                .zip(r.shift_correlations.iter())
+                .map(|(&s, &c)| format!("{s:+}:{c:.3}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             println!(
                 "{indent}shift-decon: mono {:.4} [k={:+}, {:+.1} ppm] {verdict}  \
-                 best_shift={:+}  mode={}  corr[-1/0/+1]={:.3}/{:.3}/{:.3}  gate={}  matched={}",
+                 best_shift={:+}  mode={}  corr[{corrs}]  gate={}  matched={}",
                 r.monoisotopic_mass,
                 k,
                 ppm,
                 r.best_shift,
                 r.mode_index,
-                r.shift_correlations[0],
-                r.shift_correlations[1],
-                r.shift_correlations[2],
                 if r.shift0_passes_gate { "PASS" } else { "fail" },
                 r.matched_isotopes,
             );
@@ -281,8 +286,8 @@ fn main() {
             println!("  (no peak at pkMZ near RT; using nearest-RT scan {apex_idx})");
         }
 
-        // --- window = apex ± 3 (<= 7 scans), exactly as refine_feature ---
-        let half = 3i32;
+        // --- window = apex ± (MAX_SCANS_TO_AVERAGE/2), exactly as refine_feature ---
+        let half = (MAX_SCANS_TO_AVERAGE / 2) as i32;
         let lo = (apex_idx - half).max(0) as usize;
         let hi = ((apex_idx + half).max(0) as usize).min(scans.len() - 1);
         println!(

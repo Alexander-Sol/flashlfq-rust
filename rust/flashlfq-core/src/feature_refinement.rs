@@ -36,7 +36,9 @@
 //!   charges" is softened to "the max-support cluster" (design's "≥2 charges, weighted by support").
 
 use crate::deconvolution::{classic_deconvolute, ClassicDeconvolutionParameters};
-use crate::isotope_shift_decon::{shift_decon, shift_decon_gated, shift_decon_in_window};
+use crate::isotope_shift_decon::{
+    best_charge_by_fit, envelope_fit_cosine, shift_decon, shift_decon_gated, shift_decon_in_window,
+};
 use crate::isotopic_envelope::{mass_to_mz_f64, C13_MINUS_C12};
 use crate::peak_indexing::{PeakKey, Scan};
 use crate::spectral_averaging::{average_spectra, SpectralAveragingParameters};
@@ -117,12 +119,19 @@ pub struct ResolvedFeature {
 ///
 /// The resulting [`RefinedFeature`] carries a single candidate mass (the shift mono); the cross-charge
 /// consensus still clusters those across charges. Experiment path (pipeline `REFINE_METHOD`).
+///
+/// When `recharge` is set, the charge is **re-selected** by the envelope-fit cosine
+/// ([`best_charge_by_fit`]) over the harmonic candidates {z/2, z, 2z}: the charge whose placed
+/// envelope best fits *and* explains the window wins. This recovers charge-halved features (a real
+/// z=2 the detector labelled z=1) and rejects the doubled-mass harmonic, by maximising the unified
+/// fit/explained/completeness metric rather than trusting the detector's charge.
 pub fn refine_feature_shift(
     feature: &DetectedFeature,
     scans: &[Scan],
     averaging_params: &SpectralAveragingParameters,
     shift_tol_ppm: f64,
     use_apex: bool,
+    recharge: bool,
 ) -> Option<RefinedFeature> {
     let s = build_feature_slices(feature, scans, averaging_params)?;
     // Detector's own most-abundant claimed peak — the anchor that cannot grab a foreign peak.
@@ -136,14 +145,40 @@ pub fn refine_feature_shift(
     } else {
         (&s.comp_mz, &s.comp_int)
     };
-    let r = shift_decon(mz, inten, anchor_mz, feature.charge, shift_tol_ppm)?;
+
+    let (refined_charge, refined_mono) = if recharge {
+        let candidates = charge_candidates(feature.charge);
+        let (z, mono, _cos) =
+            best_charge_by_fit(mz, inten, anchor_mz, &candidates, shift_tol_ppm, 0.0)?;
+        (z, mono)
+    } else {
+        let r = shift_decon(mz, inten, anchor_mz, feature.charge, shift_tol_ppm)?;
+        (feature.charge, r.monoisotopic_mass)
+    };
     Some(RefinedFeature {
         detected: feature.clone(),
-        refined_monoisotopic_mass: r.monoisotopic_mass,
-        refined_charge: feature.charge,
-        candidate_masses: vec![r.monoisotopic_mass],
-        decon_score: r.shift_correlations[1],
+        refined_monoisotopic_mass: refined_mono,
+        refined_charge,
+        candidate_masses: vec![refined_mono],
+        decon_score: envelope_fit_cosine(mz, inten, mass_to_mz_f64(refined_mono, refined_charge), refined_charge, shift_tol_ppm, 0.2, 0.0),
     })
+}
+
+/// Harmonic charge candidates for re-selection: the detector's charge plus its half and double,
+/// bounded to `[1, 6]` and deduped. Catches both charge-halving (real z=2 labelled z=1 → include 2z)
+/// and the doubled-mass harmonic (real z=1 labelled z=2 → include z/2).
+fn charge_candidates(z: i32) -> Vec<i32> {
+    let mut c = vec![z];
+    if z * 2 <= 6 {
+        c.push(z * 2);
+    }
+    if z % 2 == 0 && z / 2 >= 1 {
+        c.push(z / 2);
+    }
+    c.retain(|&x| (1..=6).contains(&x));
+    c.sort_unstable();
+    c.dedup();
+    c
 }
 
 /// Whether `mz` falls on this feature's isotope grid — within [`GRID_PPM`] of `mono_mz + k·spacing`
@@ -742,7 +777,7 @@ fn four_way_decon_inner(
                 charge,
                 detector_mono,
                 r.shift0_passes_gate,
-                r.shift_correlations[1],
+                r.shift0_correlation(),
             ));
         }
         // Shift apex.
@@ -764,7 +799,7 @@ fn four_way_decon_inner(
                 charge,
                 detector_mono,
                 r.shift0_passes_gate,
-                r.shift_correlations[1],
+                r.shift0_correlation(),
             ));
         }
     }

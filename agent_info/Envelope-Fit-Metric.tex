@@ -1,0 +1,352 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue,
+  citecolor=black
+}
+
+\newcommand{\tvec}{\mathbf{t}}
+\newcommand{\ovec}{\mathbf{o}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+
+\title{An Envelope-Fit Metric for Charge-State and Monoisotope Selection}
+\author{FlashLFQ-Rust}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+In untargeted MS1 feature detection, deciding which \emph{charge state} and
+monoisotopic mass best explain an observed isotopic envelope is a model-selection
+problem. The current detector scores a hypothesis with an un-normalized weighted
+sum of comb-weighted, retention-time--smoothed intensities. That statistic rewards
+matched peaks but is blind to two failure modes: predicted isotope teeth that are
+\emph{missing}, and observed peaks the hypothesis leaves \emph{unexplained}. As a
+consequence it systematically mislabels a real charge-$2$ envelope (isotopes
+$0.5$~Th apart) as charge-$1$ (isotopes $1.0$~Th apart), because the $z{=}1$ comb
+lands on every other peak and the raw sum does not care about the peaks in between.
+We propose a single unified score: the \emph{cosine similarity} between the
+theoretical averagine envelope and the observed intensities, evaluated over the
+\emph{union} of predicted-isotope positions and in-window observed peaks. We show
+that this one quantity simultaneously measures goodness of fit, the fraction of
+observed signal explained, and predicted-peak completeness --- and that its square
+is exactly the fraction of observed signal energy captured by the best-scaled
+envelope. On a concrete peptide (EFLDVIK, true charge $2$) the metric cleanly ranks
+the true charge above both the harmonic $z{=}1$ and the over-split $z{=}3$
+hypotheses, where no single sub-metric does.
+\end{abstract}
+
+\section{Motivation}
+\label{sec:motivation}
+
+\subsection{The \texttt{RawSum} statistic and why it fails}
+
+For a charge/monoisotope hypothesis the detector currently accumulates
+\begin{equation}
+\texttt{RawSum} \;=\; \sum_{k}\sum_{s} w_k \, g_s \, I_{k,s},
+\label{eq:rawsum}
+\end{equation}
+where $k$ indexes the predicted isotope teeth of the hypothesis, $s$ indexes scans
+across the retention-time (RT) apex, $w_k$ is the averagine comb weight of tooth
+$k$, $g_s$ is an RT-Gaussian weight centered on the apex, and $I_{k,s}$ is the
+observed intensity found at the $m/z$ of tooth $k$ in scan $s$.
+
+Equation~\eqref{eq:rawsum} is a \emph{matched-filter response}. It grows with every
+predicted tooth that happens to find intensity, and it is never decremented. Two
+things it cannot see:
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{Missing predicted teeth.} If a tooth the model requires has no
+  intensity, that tooth simply contributes $0$ to the sum. A hypothesis that
+  explains half of its own predicted envelope is not penalized relative to one that
+  explains all of it, as long as the absolute matched intensity is comparable.
+  \item \textbf{Unexplained observed peaks.} Any observed peak that does \emph{not}
+  sit on a predicted tooth is invisible to Eq.~\eqref{eq:rawsum} entirely. A
+  hypothesis is free to ignore half the signal in the window at no cost.
+\end{enumerate}
+Because the score is neither normalized for completeness nor penalized for the
+signal it ignores, it does not distinguish a correct charge from a \emph{harmonic}
+charge.
+
+\subsection{The harmonic example}
+
+Consider a genuine charge-$2$ peptide. Its isotope teeth are spaced
+$1.00\text{--}\mathrm{Da}/2 \approx 0.5$~Th apart. A charge-$1$ hypothesis predicts
+teeth $1.0$~Th apart --- i.e. on \emph{every other} observed peak. Schematically,
+over eight observed peaks $P_0,\dots,P_7$ spaced $0.5$~Th:
+
+\begin{center}
+\ttfamily
+\begin{tabular}{l l}
+observed ($0.5$~Th grid): & P0  P1  P2  P3  P4  P5  P6  P7 \\
+$z{=}2$ comb (true):      & \^{}\ \ \^{}\ \ \^{}\ \ \^{}\ \ \^{}\ \ \^{}\ \ \^{}\ \ \^{}\ \ (hits every peak) \\
+$z{=}1$ comb (harmonic):  & \^{}\ \ \ \ \ \ \^{}\ \ \ \ \ \ \^{}\ \ \ \ \ \ \^{}\ \ \ \ (hits every \emph{other} peak) \\
+\end{tabular}
+\end{center}
+
+The $z{=}1$ comb finds real intensity at $P_0, P_2, P_4, P_6$ and produces a large
+\texttt{RawSum}. The intervening peaks $P_1, P_3, P_5, P_7$ --- which are precisely
+the evidence that the true spacing is $0.5$~Th, not $1.0$~Th --- contribute nothing
+to the $z{=}1$ score and nothing against it. The matched filter is happy; the charge
+label is wrong. What is missing is any term that charges the $z{=}1$ hypothesis for
+the half of the envelope it declines to explain.
+
+\section{The three requirements}
+\label{sec:requirements}
+
+A score fit for charge/monoisotope selection must combine three properties that the
+harmonic example shows to be individually insufficient:
+\begin{enumerate}[label=\textbf{P\arabic*.},leftmargin=3.2em]
+  \item \textbf{Goodness of fit.} The observed intensities should match the
+  \emph{shape} of the theoretical isotope-ratio pattern, not merely be present.
+  \item \textbf{Explained fraction.} Observed signal inside the window that the
+  hypothesis does not predict should count against it; a hypothesis may not ignore
+  half the peaks for free.
+  \item \textbf{Completeness.} A predicted tooth that is absent from the data should
+  count against the hypothesis; a half-present envelope is a worse explanation than
+  a fully present one.
+\end{enumerate}
+The central claim of this note is that these three requirements are not three terms
+to be weighted and summed. They are three behaviors of one quantity.
+
+\section{The metric}
+\label{sec:metric}
+
+\subsection{Union grid and formula}
+
+Let the \emph{window} be a fixed $m/z$ interval around the candidate monoisotope
+(Section~\ref{sec:design}). Define two index sets:
+\begin{align*}
+\mathcal{T} &= \{\text{predicted isotope positions of the hypothesis with weight above the significance cutoff}\},\\
+\mathcal{O} &= \{\text{observed peaks in the window above the noise floor}\}.
+\end{align*}
+Form the \textbf{union grid} $\mathcal{G} = \mathcal{T} \cup \mathcal{O}$ by merging
+positions that coincide (within an $m/z$ tolerance) and keeping the rest. On this
+common grid build two vectors indexed by $j \in \mathcal{G}$:
+\[
+t_j = \begin{cases} \text{theoretical averagine weight at } j, & j \in \mathcal{T},\\[2pt] 0, & j \notin \mathcal{T},\end{cases}
+\qquad
+o_j = \begin{cases} \text{observed intensity at } j, & j \in \mathcal{O},\\[2pt] 0, & j \notin \mathcal{O}.\end{cases}
+\]
+The score is the cosine similarity of these two vectors:
+\begin{equation}
+\boxed{\;
+S \;=\; \frac{\sum_{j\in\mathcal{G}} t_j\, o_j}
+             {\sqrt{\sum_{j\in\mathcal{G}} t_j^2}\;\sqrt{\sum_{j\in\mathcal{G}} o_j^2}}
+   \;=\; \frac{\tvec\cdot\ovec}{\norm{\tvec}\,\norm{\ovec}}\; }
+\label{eq:cosine}
+\end{equation}
+with $S \in [0,1]$ for non-negative intensities.
+
+\subsection{How one formula delivers all three properties}
+
+The union grid is what makes Eq.~\eqref{eq:cosine} do three jobs at once. Every grid
+slot falls into one of three cases, and each case moves $S$ in exactly the direction
+one of P1--P3 demands.
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{@{}p{3.6cm} c c p{5.4cm}@{}}
+\toprule
+\textbf{Grid slot} & $t_j$ & $o_j$ & \textbf{Effect on $S$} \\
+\midrule
+Matched tooth
+  & large & large
+  & Raises the numerator $\tvec\cdot\ovec$ when the ratio $o_j/t_j$ agrees with the
+    envelope shape \textbf{(P1: fit)}. \\
+Missing predicted tooth ($j\in\mathcal{T}\setminus\mathcal{O}$)
+  & large & $0$
+  & Contributes to $\norm{\tvec}$ (denominator) but nothing to the numerator, so $S$
+    drops \textbf{(P3: completeness)}. \\
+Unexplained observed peak ($j\in\mathcal{O}\setminus\mathcal{T}$)
+  & $0$ & large
+  & Contributes to $\norm{\ovec}$ (denominator) but nothing to the numerator, so $S$
+    drops \textbf{(P2: explained fraction)}. \\
+\bottomrule
+\end{tabular}
+\caption{Each type of union-grid slot maps to one required property. There are no
+free parameters trading the three off; they are the same denominator/numerator
+bookkeeping.}
+\label{tab:mapping}
+\end{table}
+
+Concretely, in the harmonic example the intervening peaks $P_1,P_3,P_5,P_7$ enter
+the $z{=}1$ score as $(t_j = 0,\, o_j = I)$ slots. They inflate $\norm{\ovec}$ with
+no numerator contribution and pull the $z{=}1$ cosine down --- exactly the penalty
+\texttt{RawSum} was missing.
+
+\subsection{Why $S^2$ \emph{is} the explained-signal fraction}
+
+The ``portion of signal explained'' is not a bolted-on term; it is what
+Eq.~\eqref{eq:cosine} already computes. Model the observed vector as a scaled copy of
+the envelope plus residual, $\ovec \approx A\,\tvec$, and choose the amplitude $A$ by
+least squares:
+\begin{equation}
+A^\star = \arg\min_A \norm{\ovec - A\tvec}^2
+        = \frac{\tvec\cdot\ovec}{\norm{\tvec}^2}.
+\label{eq:amp}
+\end{equation}
+The energy of the observed signal splits into the part captured by the best-scaled
+envelope and the residual. Using $A^\star$,
+\begin{align}
+\norm{\ovec - A^\star \tvec}^2
+  &= \norm{\ovec}^2 - 2A^\star (\tvec\cdot\ovec) + (A^\star)^2\norm{\tvec}^2 \nonumber\\
+  &= \norm{\ovec}^2 - \frac{(\tvec\cdot\ovec)^2}{\norm{\tvec}^2}.
+\label{eq:residual}
+\end{align}
+Define the coefficient of determination through the origin,
+$R^2 = 1 - \dfrac{\norm{\ovec - A^\star\tvec}^2}{\norm{\ovec}^2}$
+(the fraction of observed energy the scaled envelope removes). Substituting
+Eq.~\eqref{eq:residual},
+\begin{equation}
+R^2 = \frac{(\tvec\cdot\ovec)^2}{\norm{\tvec}^2\,\norm{\ovec}^2} = S^2 .
+\label{eq:r2}
+\end{equation}
+So $S^2$ is \emph{literally} the fraction of observed signal energy explained by the
+best-scaled averagine envelope, evaluated over a grid that already contains the
+unexplained peaks. Property P2 is therefore not an add-on: once the union grid
+includes the observed peaks the envelope ignores, the cosine's square is the
+explained-energy fraction. ($S$ and $S^2$ are monotonically related, so the choice
+between reporting the cosine or its square is one of interpretation only.)
+
+\section{Design choices}
+\label{sec:design}
+
+Four judgment calls determine the metric's behavior. They are where the real
+engineering lives.
+
+\paragraph{The window (what ``should be explained'' means).}
+The window sets the domain of $\mathcal{O}$ --- the set of observed peaks the
+hypothesis is held responsible for. We take it to span from the candidate
+monoisotope to $\text{mono} + n\cdot\Delta$ (where $\Delta$ is the isotope spacing
+and $n$ the number of significant teeth) plus a small margin. \textbf{The same
+window, in $m/z$, is used for every charge hypothesis at a given monoisotope.} This
+is deliberate: a co-eluting interferent inside the window then penalizes every charge
+hypothesis equally, so it drags all absolute scores down together and leaves the
+\emph{comparison} between charges fair. Using a per-charge window would let a
+hypothesis quietly shrink its own accountability. The window boundary is the most
+consequential parameter in the whole scheme.
+
+\paragraph{Noise threshold.}
+Before an observed peak is added as a $(t=0,\,o=I)$ slot, it must clear a noise
+floor $\eta$. Without this, ordinary baseline noise in the window would read as
+``unexplained signal'' and depress every cosine, muddying the comparison and
+biasing the metric against the true (fully-explaining) hypothesis. Peaks below
+$\eta$ are simply not placed on the grid.
+
+\paragraph{Cosine, not Pearson.}
+Use cosine similarity, \emph{not} the Pearson correlation. Pearson mean-centers each
+vector before the dot product; that subtraction destroys the meaning of a zero. An
+\emph{absent} isotope peak should read as the number $0$ (``no intensity''), but
+Pearson re-interprets it as ``below the average intensity,'' which is not the same
+thing and can even reward a hypothesis for a systematically empty tooth. The zero
+must mean zero for P2 and P3 to work, so mean-centering is disqualifying here.
+(FlashLFQ uses Pearson correlation for its binary accept/reject \emph{gate}; that is
+a different task. For a fit-and-coverage \emph{score} over a union grid with
+meaningful zeros, cosine is the correct choice.)
+
+\paragraph{Significance cutoff.}
+Which theoretical teeth count as ``predicted'' (the set $\mathcal{T}$) is set by a
+weight cutoff --- e.g.\ keep teeth whose averagine weight is $\ge 0.2$ of the modal
+tooth. Teeth below the cutoff are negligible in the theoretical pattern; including
+them would add near-zero $t_j$ slots that only add noise to the completeness
+accounting.
+
+\section{Validation}
+\label{sec:validation}
+
+We evaluated the metric on peptide \textbf{EFLDVIK}, true charge $2$, monoisotopic
+mass $862.488$~Da, with $15$ observed peaks inside the window. The existing detector
+had \emph{mislabeled} this feature as charge $1$ at mass $431$~Da --- the harmonic
+error of Section~\ref{sec:motivation}. Table~\ref{tab:validation} reports, for each
+charge hypothesis, completeness (fraction of predicted teeth present), the explained
+fraction (\%), and the union-grid cosine $S$.
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}l c c c c@{}}
+\toprule
+\textbf{Hypothesis} & \textbf{Mass (Da)} & \textbf{Completeness} & \textbf{\% explained} & \textbf{cosine $S$ (union)} \\
+\midrule
+$z=1$ (harmonic)      & $431$  & $1.00$ & $0.60$ & $0.905$ \\
+$\mathbf{z=2}$ (true) & $862$  & $1.00$ & $0.76$ & $\mathbf{0.984}$ \\
+$z=3$ (over-split)    & $1294$ & $0.33$ & $0.54$ & $0.718$ \\
+\bottomrule
+\end{tabular}
+\caption{EFLDVIK charge selection. The unified cosine ranks the true charge first;
+neither sub-metric does so alone.}
+\label{tab:validation}
+\end{table}
+
+\paragraph{What the table shows.}
+Read column by column, the sub-metrics each fail on their own:
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Completeness alone ties $z{=}1$ and $z{=}2$} ($1.00$ vs $1.00$). Both
+  the true charge and its harmonic have all their predicted teeth present --- of
+  course they do, since the $z{=}1$ teeth are a subset of the $z{=}2$ peaks.
+  Completeness cannot break the harmonic tie and cannot fix the mislabel. It does,
+  correctly, sink $z{=}3$ ($0.33$), which predicts teeth at $0.33$~Th spacings that
+  are largely absent.
+  \item \textbf{Explained fraction alone catches $z{=}1$} ($0.60 < 0.76$), because
+  the harmonic ignores the intervening peaks --- but on its own it does not cleanly
+  separate the field ($z{=}3$ at $0.54$ is close to $z{=}1$ at $0.60$, for the
+  unrelated reason that $z{=}3$ predicts too much).
+  \item \textbf{The unified cosine separates all three.} $z{=}1$ is pulled down to
+  $0.905$ by the unexplained intervening peaks (P2); $z{=}3$ is pulled down to
+  $0.718$ by its missing teeth (P3); $z{=}2$ retains a high $0.984$ because it both
+  explains the observed peaks and has all its predicted teeth present (P1--P3
+  together). The true charge wins.
+\end{itemize}
+This is the argument for a single cosine-over-union score rather than any one
+sub-metric or an ad~hoc weighted blend: the three requirements are already
+co-resident in Eq.~\eqref{eq:cosine}, and only their combination ranks the
+hypotheses correctly.
+
+\section{Caveats and implementation note}
+\label{sec:caveats}
+
+\paragraph{Caveats (stated honestly).}
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{The winning margin is modest.} $0.984$ vs $0.905$ is a real
+  separation but not a chasm. Reliable charge \emph{re-selection} across a full
+  dataset needs empirical validation before it replaces the existing decision: on
+  genuinely noisy or sparse envelopes the metric could begin to prefer higher
+  charges (which predict more, finer teeth and can accrue spurious matched
+  intensity). This must be measured, not assumed.
+  \item \textbf{The window boundary dominates.} As noted in
+  Section~\ref{sec:design}, the choice of window is the single most consequential
+  parameter; it defines what counts as ``unexplained'' and therefore the entire P2
+  penalty. It deserves the most tuning and the most scrutiny.
+  \item \textbf{Chimeric envelopes lower the cosine --- correctly.} When two
+  features co-elute and overlap, no single-envelope hypothesis explains all the
+  in-window signal, and every cosine is depressed. This is the \emph{right} signal:
+  a uniformly low $S$ across all charges is a flag to route the window to advanced
+  multi-envelope deconvolution rather than to force a single-charge label.
+\end{itemize}
+
+\paragraph{Implementation note.}
+The detector already contains most of this. The opt-in scorer
+\texttt{ScoreModel::NormalizedNoiseFloor} with the \texttt{score\_cosine} flag
+computes a cosine, but currently only over the \emph{comb} slots --- i.e.\ over
+$\mathcal{T}$ alone. Over $\mathcal{T}$ the cosine already delivers P1 (fit) and P3
+(completeness, via the missing-tooth $(t{>}0,o{=}0)$ slots), but it is blind to P2
+because unexplained observed peaks off the comb are never on the grid. The single
+change that upgrades it to the full three-property metric is to add the in-window
+observed peaks that are \emph{not} on the comb as $(t=0,\,o=I)$ slots (after the
+noise-floor filter) before taking the cosine. That one addition to the grid turns the
+existing comb cosine into Eq.~\eqref{eq:cosine}, and with it $S^2$ becomes the
+explained-energy fraction of Section~\ref{sec:metric}.
+
+\end{document}

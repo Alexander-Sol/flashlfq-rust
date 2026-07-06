@@ -25,17 +25,34 @@
 //! parity-gated classic deconvolution and FlashLFQ's use of the observed peak as the reference.
 //!
 //! The averagine template (indexed from the monoisotope, `k = 0`) has its **mode** — its tallest
-//! tooth — at the isotope index that the most-intense mass represents. Placing that mode tooth at the
-//! anchor pins the whole comb; the monoisotope then falls out at `anchor − mode·spacing`. The `-1 / 0
-//! / +1` search perturbs that placement by one ¹³C and keeps the shift whose comb best correlates
-//! with the observed intensities, which is what corrects a mis-placed monoisotope.
+//! tooth — at the isotope index that the most-intense mass represents. That mode index locates the
+//! monoisotope relative to the anchor (`anchor − mode·spacing` under the accurate hypothesis). The
+//! shift search then perturbs that placement by whole ¹³C units and keeps the shift whose envelope
+//! best explains the observed intensities.
+//!
+//! ## Per-shift template + shared-grid scoring (removes the shift-0 bias)
+//! Each shift hypothesis is scored with its **own** averagine template, rebuilt (mono-keyed) at that
+//! shift's candidate monoisotope, and every shift is correlated against **one shared observed grid**
+//! spanning all the candidate tooth positions. This matters: an earlier version pinned a single
+//! template's mode onto the (tallest) anchor and slid only the observed sampling, which handed shift
+//! 0 a guaranteed max-on-max covariance term and biased the argmax toward shift 0 regardless of the
+//! rest of the envelope. Scoring on a shared grid penalises a shift for observed peaks it fails to
+//! predict, so the winner is the shift that explains the *whole* envelope, not just the tallest peak.
+//!
+//! ## Charge-dependent shift range
+//! Light peptides only need `-1 / 0 / +1`. Heavier peptides — which carry higher charge — spread
+//! their envelope over more isotopes and can be seeded up to two ¹³C units off, so at
+//! `|charge| >= WIDE_SHIFT_MIN_CHARGE` the search widens to `-2 .. +2` (see [`shifts_for_charge`]).
 //!
 //! This is **new algorithm work** (an untargeted adaptation, not a line-by-line port), so it carries
-//! its own unit tests rather than a C# golden. The Pearson correlation it scores with is the same
-//! parity-ported [`crate::isotopic_envelope::pearson`] FlashLFQ uses.
+//! its own unit tests rather than a C# golden. Shifts are scored by **cosine similarity** ([`cosine`])
+//! rather than FlashLFQ's Pearson: on sparse non-negative envelope vectors Pearson mean-centres, which
+//! rewards co-absent teeth (shared zeros read as agreement) and blurs the miss penalty, whereas cosine
+//! treats a zero as no contribution so a predicted-but-absent tooth and an unexplained observed peak
+//! each lower the score — the standard MS spectral-angle behaviour.
 
-use crate::deconvolution::averagine_comb_weights;
-use crate::isotopic_envelope::{pearson, C13_MINUS_C12, PROTON_MASS};
+use crate::deconvolution::{averagine_comb_weights, averagine_intensities_from_mono};
+use crate::isotopic_envelope::{C13_MINUS_C12, PROTON_MASS};
 
 /// Relative weight below which the averagine template's descending high-mass tail is dropped
 /// (passed to [`averagine_comb_weights`]). Teeth up to and including the mode are always kept.
@@ -44,10 +61,28 @@ const TEMPLATE_MIN_WEIGHT: f64 = 1e-3;
 /// Hard cap on averagine template length (isotope teeth) requested from the model.
 const TEMPLATE_MAX_ISOTOPES: usize = 20;
 
-/// The ¹³C shift hypotheses tested, in ascending order: the monoisotope is one ¹³C too low (`-1`),
-/// correctly placed (`0`), or one ¹³C too high (`+1`). Index into
-/// [`ShiftDeconResult::shift_correlations`] is `shift + 1`.
-pub const SHIFTS: [i32; 3] = [-1, 0, 1];
+/// The default ¹³C shift hypotheses (ascending): the monoisotope is one ¹³C too low (`-1`), correctly
+/// placed (`0`), or one ¹³C too high (`+1`).
+pub const BASE_SHIFTS: [i32; 3] = [-1, 0, 1];
+
+/// The wider shift set used at high charge, where a heavier peptide's envelope is spread over more
+/// isotopes and the seed can be misplaced by up to two ¹³C units.
+pub const WIDE_SHIFTS: [i32; 5] = [-2, -1, 0, 1, 2];
+
+/// Minimum `|charge|` at which the wider [`WIDE_SHIFTS`] (`-2..+2`) set is searched instead of the
+/// default [`BASE_SHIFTS`] (`-1..+1`). Charges of this magnitude and above correspond to the heavier
+/// peptides whose off-by-one can span two isotopes.
+pub const WIDE_SHIFT_MIN_CHARGE: i32 = 4;
+
+/// The shift hypotheses to search for a given charge: [`WIDE_SHIFTS`] once `|charge|` reaches
+/// [`WIDE_SHIFT_MIN_CHARGE`], else [`BASE_SHIFTS`].
+pub fn shifts_for_charge(charge: i32) -> &'static [i32] {
+    if charge.abs() >= WIDE_SHIFT_MIN_CHARGE {
+        &WIDE_SHIFTS
+    } else {
+        &BASE_SHIFTS
+    }
+}
 
 /// Result of an untargeted isotope-shift deconvolution around one anchor peak.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,16 +92,23 @@ pub struct ShiftDeconResult {
     pub monoisotopic_mass: f64,
     /// Charge state searched (as supplied by the caller).
     pub charge: i32,
-    /// The ¹³C shift (`-1`, `0`, or `+1`) whose comb best correlated with the observed intensities.
+    /// The ¹³C shift whose rebuilt template best correlated with the observed intensities (drawn from
+    /// [`shifts`](Self::shifts)). Ties resolve to the lower (smaller) shift.
     pub best_shift: i32,
-    /// Per-shift Pearson correlation of the averagine template to the observed intensities, indexed
-    /// `[shift + 1]` (so `[0]` = shift −1, `[1]` = shift 0, `[2]` = shift +1). `NaN` correlations
-    /// (degenerate/constant windows) are mapped to `-1.0`, matching FlashLFQ's gate handling.
-    pub shift_correlations: [f64; 3],
-    /// Whether the accurate (shift-0) hypothesis passes FlashLFQ's acceptance gate: its correlation
-    /// exceeds `0.7` and neither shifted neighbour beats it by `0.1` or more. When `false`, shift 0
-    /// is *not* confidently the monoisotope placement (a neighbour explains the data as well or
-    /// better) — the signal the four-way disagreement router will key on.
+    /// The ¹³C shift hypotheses evaluated, ascending — [`BASE_SHIFTS`] (`-1..+1`) normally, or
+    /// [`WIDE_SHIFTS`] (`-2..+2`) at `|charge| >= WIDE_SHIFT_MIN_CHARGE`. Parallel to
+    /// [`shift_correlations`](Self::shift_correlations).
+    pub shifts: Vec<i32>,
+    /// Per-shift **cosine similarity** ([`cosine`]) of that shift's rebuilt averagine template to the
+    /// observed intensities, scored on a grid shared by all shifts (so a shift is penalised for
+    /// observed peaks it fails to predict). Parallel to [`shifts`](Self::shifts). Degenerate windows
+    /// (zero-norm observed vector) are mapped to `-1.0` so they rank last. Use
+    /// [`shift0_correlation`](Self::shift0_correlation) to read the accurate-hypothesis value.
+    pub shift_correlations: Vec<f64>,
+    /// Whether the accurate (shift-0) hypothesis passes the acceptance gate: its cosine similarity
+    /// exceeds [`GATE_MIN_CORRELATION`] and neither ±1 neighbour beats it by [`GATE_NEIGHBOUR_MARGIN`]
+    /// or more. When `false`, shift 0 is *not* confidently the monoisotope placement (a neighbour
+    /// explains the data as well or better) — the signal the four-way disagreement router keys on.
     pub shift0_passes_gate: bool,
     /// Neutral mass of the anchor (observed most-abundant) peak, `to_mass(anchor_mz, charge)`.
     pub most_intense_mass: f64,
@@ -78,7 +120,23 @@ pub struct ShiftDeconResult {
     pub matched_isotopes: usize,
 }
 
-/// FlashLFQ's acceptance gate thresholds (`CheckIsotopicEnvelopeCorrelation`).
+impl ShiftDeconResult {
+    /// Correlation of the accurate (shift-0) hypothesis. Shift 0 is always evaluated, so this is
+    /// always present; returns `-1.0` only in the impossible case that it is absent.
+    pub fn shift0_correlation(&self) -> f64 {
+        self.shifts
+            .iter()
+            .position(|&s| s == 0)
+            .map(|i| self.shift_correlations[i])
+            .unwrap_or(-1.0)
+    }
+}
+
+/// Acceptance-gate thresholds, structurally from FlashLFQ's `CheckIsotopicEnvelopeCorrelation`
+/// (min-correlation + neighbour-margin). NOTE: these values were calibrated for FlashLFQ's *Pearson*
+/// correlation; this module now scores with **cosine**, which on non-negative vectors runs higher,
+/// so the `0.7` floor is looser than under Pearson. They are reasonable starting points but should be
+/// re-tuned against the `obo_envelope_probe` scorecard.
 const GATE_MIN_CORRELATION: f64 = 0.7;
 const GATE_NEIGHBOUR_MARGIN: f64 = 0.1;
 
@@ -87,6 +145,31 @@ const GATE_NEIGHBOUR_MARGIN: f64 = 0.1;
 #[inline]
 fn mz_to_mass(mz: f64, charge: i32) -> f64 {
     charge.abs() as f64 * mz - charge as f64 * PROTON_MASS
+}
+
+/// Uncentered cosine similarity of two equal-length non-negative vectors: `⟨a,b⟩ / (‖a‖·‖b‖)`.
+///
+/// Preferred over [`crate::isotopic_envelope::pearson`] for scoring an averagine template against
+/// observed isotope intensities. Pearson mean-centres, which on sparse non-negative envelopes turns
+/// co-absent teeth into positive covariance (shared zeros read as agreement) and makes every miss a
+/// negative deviation that blurs the penalty. Cosine treats a zero as no contribution, so a
+/// predicted-but-absent tooth (adds to `‖a‖` only) and an unexplained observed peak (adds to `‖b‖`
+/// only) each lower the score. Returns `-1.0` when either vector has zero norm (degenerate), so the
+/// shift argmax and the gate rank it last.
+fn cosine(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    if norm_a <= 0.0 || norm_b <= 0.0 {
+        return -1.0;
+    }
+    dot / (norm_a.sqrt() * norm_b.sqrt())
 }
 
 /// Index of the maximum element (first on ties). Empty slice yields 0 (callers guard emptiness).
@@ -145,70 +228,107 @@ pub fn shift_decon(
     }
 
     let most_intense_mass = mz_to_mass(anchor_mz, charge);
-    // Averagine template keyed by the *most-intense* mass, indexed from the monoisotope (k = 0),
-    // normalized so the max (mode) tooth is 1.0.
-    let template = averagine_comb_weights(most_intense_mass, TEMPLATE_MIN_WEIGHT, TEMPLATE_MAX_ISOTOPES);
-    if template.is_empty() {
+    // Anchor-keyed averagine (indexed from the monoisotope, k = 0) used ONLY to locate the mono
+    // relative to the tallest (anchor) peak: its mode sits `mode_index` ¹³C units above the mono, so
+    // the shift-0 monoisotope is `mode_index` units below the anchor.
+    let base = averagine_comb_weights(most_intense_mass, TEMPLATE_MIN_WEIGHT, TEMPLATE_MAX_ISOTOPES);
+    if base.is_empty() {
         return None;
     }
-    let mode_index = argmax(&template);
+    let mode_index = argmax(&base) as i32;
     let spacing = C13_MINUS_C12 / charge.abs() as f64;
 
-    // Build the correlation vectors for each shift. The theoretical vector prepends a below-mono
-    // padding tooth (theoretical intensity 0) so a hypothesis is penalised when there is unexpected
-    // signal just below where it places the monoisotope — FlashLFQ's off-by-one discriminator.
-    let mut correlations = [-1.0f64; 3];
-    let mut matched_counts = [0usize; 3];
-    for (si, &shift) in SHIFTS.iter().enumerate() {
-        // Theoretical (T) and observed (O) over teeth k = -1 (pad), 0, 1, ..., template.len()-1.
-        let mut theor: Vec<f64> = Vec::with_capacity(template.len() + 1);
-        let mut obs: Vec<f64> = Vec::with_capacity(template.len() + 1);
+    let shifts = shifts_for_charge(charge);
+
+    // For each shift hypothesis, rebuild a *mono-keyed* averagine template placed at that shift's
+    // candidate monoisotope. `mono_offset` is the tooth-k=0 position as an integer ¹³C offset from
+    // the anchor; the whole template spans `[mono_offset, mono_offset + len - 1]`, with a padding
+    // tooth at `mono_offset - 1` (theoretical 0) to catch unexpected below-mono signal.
+    let mut templates: Vec<Vec<f64>> = Vec::with_capacity(shifts.len());
+    let mut mono_offsets: Vec<i32> = Vec::with_capacity(shifts.len());
+    let mut j_lo = i32::MAX;
+    let mut j_hi = i32::MIN;
+    for &shift in shifts {
+        let o_s = shift - mode_index;
+        let cand_mono_mass = mz_to_mass(anchor_mz + o_s as f64 * spacing, charge);
+        let t = averagine_intensities_from_mono(cand_mono_mass, TEMPLATE_MIN_WEIGHT, TEMPLATE_MAX_ISOTOPES);
+        j_lo = j_lo.min(o_s - 1);
+        j_hi = j_hi.max(o_s + t.len() as i32 - 1).max(o_s);
+        templates.push(t);
+        mono_offsets.push(o_s);
+    }
+    if j_hi < j_lo {
+        return None;
+    }
+
+    // Observed intensities on a grid SHARED by every shift (integer ¹³C offsets j = j_lo..=j_hi from
+    // the anchor). Because the observed vector is identical across shifts, each shift is scored on
+    // the same evidence: a shift that leaves a strong observed peak unexplained (obs large, theor 0)
+    // is penalised, and one that predicts a tooth where nothing is observed is penalised too. This
+    // removes the old shift-0 bias, where pinning the template's mode onto the tallest anchor peak
+    // handed shift 0 a free max-on-max covariance term regardless of the rest of the envelope.
+    let grid_len = (j_hi - j_lo + 1) as usize;
+    let mut obs = vec![0.0f64; grid_len];
+    for (gi, j) in (j_lo..=j_hi).enumerate() {
+        let target_mz = anchor_mz + j as f64 * spacing;
+        obs[gi] = nearest_within_ppm(mz, intensity, target_mz, tol_ppm).unwrap_or(0.0);
+    }
+
+    let mut correlations = vec![-1.0f64; shifts.len()];
+    let mut matched_counts = vec![0usize; shifts.len()];
+    for si in 0..shifts.len() {
+        let o_s = mono_offsets[si];
+        let t = &templates[si];
+        let mut theor = vec![0.0f64; grid_len];
         let mut matched = 0usize;
-        for k in -1..(template.len() as i32) {
-            let t = if k < 0 { 0.0 } else { template[k as usize] };
-            // Predicted m/z of tooth k under this shift: the mode tooth sits at the anchor for
-            // shift 0, and the whole comb slides by `shift` ¹³C units.
-            let predicted_mz = anchor_mz + (k - mode_index as i32 + shift) as f64 * spacing;
-            let o = nearest_within_ppm(mz, intensity, predicted_mz, tol_ppm).unwrap_or(0.0);
-            if k >= 0 && o > 0.0 {
-                matched += 1;
+        for (gi, j) in (j_lo..=j_hi).enumerate() {
+            let k = j - o_s;
+            if k >= 0 && (k as usize) < t.len() {
+                theor[gi] = t[k as usize];
+                if obs[gi] > 0.0 {
+                    matched += 1;
+                }
             }
-            theor.push(t);
-            obs.push(o);
         }
-        let mut corr = pearson(&theor, &obs);
-        if corr.is_nan() {
-            corr = -1.0;
-        }
-        correlations[si] = corr;
+        // Cosine (not Pearson): uncentered, so it penalises predicted-but-absent teeth and
+        // unexplained observed peaks symmetrically without crediting shared zeros. Degenerate
+        // (zero-norm) windows already return -1.0.
+        correlations[si] = cosine(&theor, &obs);
         matched_counts[si] = matched;
     }
 
     // Winning shift = the best-correlating hypothesis (ties resolve to the lower index, i.e. the
     // smaller shift, which prefers the correctly-placed or lower monoisotope over a higher guess).
     let best_si = argmax(&correlations);
-    let best_shift = SHIFTS[best_si];
+    let best_shift = shifts[best_si];
 
-    // FlashLFQ acceptance gate for the accurate (shift-0) hypothesis.
-    let corr0 = correlations[1];
-    let corr_left = correlations[0];
-    let corr_right = correlations[2];
+    // FlashLFQ acceptance gate for the accurate (shift-0) hypothesis, judged against its immediate
+    // ±1 neighbours (the genuine off-by-one question, independent of the wider ±2 search).
+    let corr_at = |want: i32| -> f64 {
+        shifts
+            .iter()
+            .position(|&s| s == want)
+            .map(|i| correlations[i])
+            .unwrap_or(f64::NEG_INFINITY)
+    };
+    let corr0 = corr_at(0);
     let shift0_passes_gate = corr0 > GATE_MIN_CORRELATION
-        && (corr_left - corr0) < GATE_NEIGHBOUR_MARGIN
-        && (corr_right - corr0) < GATE_NEIGHBOUR_MARGIN;
+        && (corr_at(-1) - corr0) < GATE_NEIGHBOUR_MARGIN
+        && (corr_at(1) - corr0) < GATE_NEIGHBOUR_MARGIN;
 
     // Monoisotope for the winning shift: tooth k = 0 sits at anchor + (best_shift - mode)·spacing.
-    let mono_mz = anchor_mz + (best_shift - mode_index as i32) as f64 * spacing;
+    let mono_mz = anchor_mz + (best_shift - mode_index) as f64 * spacing;
     let monoisotopic_mass = mz_to_mass(mono_mz, charge);
 
     Some(ShiftDeconResult {
         monoisotopic_mass,
         charge,
         best_shift,
+        shifts: shifts.to_vec(),
         shift_correlations: correlations,
         shift0_passes_gate,
         most_intense_mass,
-        mode_index,
+        mode_index: mode_index as usize,
         matched_isotopes: matched_counts[best_si],
     })
 }
@@ -238,6 +358,181 @@ pub fn shift_decon_in_window(
         }
     }
     shift_decon(mz, intensity, mz[anchor_idx], charge, tol_ppm)
+}
+
+/// Fraction of a feature's expected **significant** isotope teeth that are actually observed.
+///
+/// For a feature placed at monoisotope m/z `mono_mz` and charge `charge`, the averagine template
+/// (keyed by the neutral mass) gives the expected relative intensity at each isotope index `k`. A
+/// tooth counts as *expected-significant* when its weight is at least `min_rel` of the mode; it is
+/// *observed* when some peak lies within `tol_ppm` of `mono_mz + k·(C13/charge)`. Returns
+/// observed / expected (`1.0` when nothing is expected).
+///
+/// Diagnoses the **charge-harmonic** artifact: a real z=1 species mislabeled z=2 has peaks only at
+/// every OTHER z=2 tooth (the 0.5-Th intervening positions are empty), so ~half its expected teeth
+/// are missing and completeness falls well below 1. A genuine envelope observes nearly all of them.
+pub fn isotope_completeness(
+    mz: &[f64],
+    intensity: &[f64],
+    mono_mz: f64,
+    charge: i32,
+    tol_ppm: f64,
+    min_rel: f64,
+) -> f64 {
+    if mz.is_empty() || charge == 0 {
+        return 1.0;
+    }
+    let mono_mass = mz_to_mass(mono_mz, charge);
+    let template =
+        averagine_intensities_from_mono(mono_mass, TEMPLATE_MIN_WEIGHT, TEMPLATE_MAX_ISOTOPES);
+    if template.is_empty() {
+        return 1.0;
+    }
+    let mode_w = template[argmax(&template)];
+    if mode_w <= 0.0 {
+        return 1.0;
+    }
+    let spacing = C13_MINUS_C12 / charge.abs() as f64;
+    let mut expected = 0usize;
+    let mut observed = 0usize;
+    for (k, &w) in template.iter().enumerate() {
+        if w / mode_w < min_rel {
+            continue;
+        }
+        expected += 1;
+        let target = mono_mz + k as f64 * spacing;
+        if nearest_within_ppm(mz, intensity, target, tol_ppm).is_some() {
+            observed += 1;
+        }
+    }
+    if expected == 0 {
+        1.0
+    } else {
+        observed as f64 / expected as f64
+    }
+}
+
+/// **Envelope-fit cosine** — the unified fit / explained / completeness metric.
+///
+/// Cosine similarity between the theoretical averagine envelope `t` and the observed intensities `o`,
+/// evaluated over the **union grid** = {predicted isotope positions} ∪ {observed peaks in the window}:
+/// `S = Σ tⱼoⱼ / (‖t‖·‖o‖)`. Each of three properties maps to one behaviour of this single formula:
+/// a **missing** predicted tooth (`t` large, `o = 0`) stays in `‖t‖` but not the numerator → S drops
+/// (completeness); an **unexplained** observed peak (`t = 0`, `o` large) inflates `‖o‖` with no
+/// numerator → S drops (fraction-explained); matching ratios raise the numerator (goodness of fit).
+/// `S²` is the fraction of observed signal energy explained by the best-scaled envelope.
+///
+/// The window is `[mono_mz − 0.5·spacing, mono_mz + (kmax+1)·spacing]` where `kmax` is the last
+/// significant tooth (weight ≥ `min_rel` of the mode); observed peaks below `noise_floor` are ignored
+/// (not counted as "unexplained"). Returns a value in `[0, 1]` (`0` on degenerate input).
+pub fn envelope_fit_cosine(
+    mz: &[f64],
+    intensity: &[f64],
+    mono_mz: f64,
+    charge: i32,
+    tol_ppm: f64,
+    min_rel: f64,
+    noise_floor: f64,
+) -> f64 {
+    if mz.is_empty() || charge == 0 {
+        return 0.0;
+    }
+    let mono_mass = mz_to_mass(mono_mz, charge);
+    let template =
+        averagine_intensities_from_mono(mono_mass, TEMPLATE_MIN_WEIGHT, TEMPLATE_MAX_ISOTOPES);
+    if template.is_empty() {
+        return 0.0;
+    }
+    let mode_w = template[argmax(&template)];
+    if mode_w <= 0.0 {
+        return 0.0;
+    }
+    let spacing = C13_MINUS_C12 / charge.abs() as f64;
+    let sig: Vec<(usize, f64)> = template
+        .iter()
+        .enumerate()
+        .filter(|(_, &w)| w / mode_w >= min_rel)
+        .map(|(k, &w)| (k, w))
+        .collect();
+    if sig.is_empty() {
+        return 0.0;
+    }
+    let kmax = sig.iter().map(|(k, _)| *k).max().unwrap();
+    let win_lo = mono_mz - 0.5 * spacing;
+    let win_hi = mono_mz + (kmax as f64 + 1.0) * spacing;
+    let lo = mz.partition_point(|&m| m < win_lo);
+    let hi = mz.partition_point(|&m| m <= win_hi);
+
+    let mut tvec: Vec<f64> = Vec::with_capacity(sig.len() + (hi - lo));
+    let mut ovec: Vec<f64> = Vec::with_capacity(sig.len() + (hi - lo));
+    let mut matched = vec![false; hi.saturating_sub(lo)];
+
+    // Predicted teeth: pull the nearest in-window peak within tolerance (else observed 0).
+    for &(k, w) in &sig {
+        let target = mono_mz + k as f64 * spacing;
+        let mut best_j: Option<usize> = None;
+        let mut best_d = f64::INFINITY;
+        for j in lo..hi {
+            let d = (mz[j] - target).abs();
+            if d < best_d {
+                best_d = d;
+                best_j = Some(j);
+            }
+        }
+        let o = match best_j {
+            Some(j) if (mz[j] - target).abs() / target * 1e6 <= tol_ppm => {
+                matched[j - lo] = true;
+                intensity[j]
+            }
+            _ => 0.0,
+        };
+        tvec.push(w);
+        ovec.push(o);
+    }
+    // Off-grid observed peaks in the window (above noise) → unexplained penalty (t = 0).
+    for j in lo..hi {
+        if !matched[j - lo] && intensity[j] > noise_floor {
+            tvec.push(0.0);
+            ovec.push(intensity[j]);
+        }
+    }
+
+    let nt = tvec.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let no = ovec.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if nt <= 0.0 || no <= 0.0 {
+        return 0.0;
+    }
+    let dot: f64 = tvec.iter().zip(ovec.iter()).map(|(t, o)| t * o).sum();
+    dot / (nt * no)
+}
+
+/// Chooses the charge from `candidates` whose shift-placed envelope best fits the slice by
+/// [`envelope_fit_cosine`]. Each candidate charge is placed with [`shift_decon`] anchored on
+/// `anchor_mz`, then scored. Returns `(charge, monoisotopic_mass, cosine)` of the best, or `None` if
+/// no candidate yields an envelope.
+pub fn best_charge_by_fit(
+    mz: &[f64],
+    intensity: &[f64],
+    anchor_mz: f64,
+    candidates: &[i32],
+    tol_ppm: f64,
+    noise_floor: f64,
+) -> Option<(i32, f64, f64)> {
+    let mut best: Option<(i32, f64, f64)> = None;
+    for &z in candidates {
+        if z == 0 {
+            continue;
+        }
+        let Some(r) = shift_decon(mz, intensity, anchor_mz, z, tol_ppm) else {
+            continue;
+        };
+        let mono_mz = r.monoisotopic_mass / z.abs() as f64 + PROTON_MASS;
+        let cos = envelope_fit_cosine(mz, intensity, mono_mz, z, tol_ppm, 0.2, noise_floor);
+        if best.map_or(true, |(_, _, bc)| cos > bc) {
+            best = Some((z, r.monoisotopic_mass, cos));
+        }
+    }
+    best
 }
 
 /// Whether `mz` is within `ppm` of any position in the ascending `sorted` list.
