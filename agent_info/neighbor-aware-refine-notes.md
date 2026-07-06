@@ -37,8 +37,9 @@ Fitness: CA/Lumos cov90 benchmark. Baseline at branch point = **602/620 recall, 
 
 Assessment: **modest but real.** The neighbour-masking mostly overlaps failure modes the shipped fixes (co-elution knitting, RECHARGE_MIN_FIT floor, fit tiebreak) already cover, so the marginal gain is small on this dataset. Not promoting to default on a +1/+1 single-dataset result; left as an opt-in experiment.
 
+- **Exp A4: low-baseline-fit gating.** Mask only features whose unmasked fit < gate (`NEIGHBOR_FIT_GATE`). Gate 0.9 at ratio 2 → 601/582 (== ungated ratio 2); at ratio 5 → 603/585 (== ungated). **No-op** — the masking already only changes low-fit features, so gating on own-fit excludes nothing. The regression at low ratio is driven by NEIGHBOR STRENGTH (masking moderate 2–5× neighbours), not the feature's own fit, so ratio is the right knob and 5× is the ceiling. Reverted the gate (it doubled the flag-path cost for no gain).
+
 ## Approaches NOT yet tried (for a deeper session)
 - **Down-weight vs hard-mask** shared peaks (competitive split by envelope expectation) — softer than the invisible mask; may reclaim the moderate-neighbour cases that regressed at low ratio.
-- **Low-baseline-fit gating** — apply the mask ONLY to features whose unmasked fit is poor (compute baseline first), leaving confident features untouched. Most literal reading of "helps low-score features"; may lift the ratio floor.
 - **Off-by-one via neighbour coherence** — for a low-score feature, test whether its ±1 mono alternatives are better explained once neighbour-owned peaks are attributed away (targets YAA directly; the walk-back gate blocks YAA at 1640 Da, so this would need to run below the gate with neighbour protection against the M-1 grab).
 - **Strongest-first at the DETECTION stage** (not just refine) with claim hand-off — the greedy detector already claims tallest-first; propagating corrected claims into weaker features' windows.
