@@ -51,6 +51,70 @@ fn neighbor_mask_for(idx: &NeighborIndex, f: &DetectedFeature, min_ratio: f64) -
         .collect()
 }
 
+/// A growing, RT-bucketed set of *already-refined* feature grids, used by the iterative
+/// (`NEIGHBOR_REFINE=iterative`) pass: features are refined in descending score order, and each locks
+/// its corrected isotope grid here so subsequent (lower-scoring) features can mask its peaks.
+struct LockedGrids {
+    /// RT bin (`floor(apex_rt / rt_tol)`) → `(apex_rt, mono_mz, spacing, kmax)`.
+    buckets: std::collections::HashMap<i64, Vec<(f64, f64, f64, i32)>>,
+    rt_tol: f64,
+}
+
+impl LockedGrids {
+    fn new(rt_tol: f64) -> Self {
+        LockedGrids { buckets: std::collections::HashMap::new(), rt_tol }
+    }
+    fn bin(&self, rt: f64) -> i64 {
+        (rt / self.rt_tol).floor() as i64
+    }
+    fn add(&mut self, apex_rt: f64, mono_mz: f64, charge: i32, kmax: i32) {
+        let spacing = C13_MINUS_C12 / charge.max(1) as f64;
+        let b = self.bin(apex_rt);
+        self.buckets.entry(b).or_default().push((apex_rt, mono_mz, spacing, kmax));
+    }
+    /// Ascending isotope m/z of locked features co-eluting with `apex_rt` and in `[win_min, win_max]`.
+    fn positions(&self, apex_rt: f64, win_min: f64, win_max: f64) -> Vec<f64> {
+        let b = self.bin(apex_rt);
+        let mut out = Vec::new();
+        for bb in (b - 1)..=(b + 1) {
+            let Some(v) = self.buckets.get(&bb) else { continue };
+            for &(rt, mono_mz, spacing, kmax) in v {
+                if (rt - apex_rt).abs() > self.rt_tol {
+                    continue;
+                }
+                for k in 0..=kmax {
+                    let m = mono_mz + k as f64 * spacing;
+                    if m < win_min {
+                        continue;
+                    }
+                    if m > win_max {
+                        break;
+                    }
+                    out.push(m);
+                }
+            }
+        }
+        out.sort_by(f64::total_cmp);
+        out
+    }
+}
+
+/// Off-own-grid filter shared by the neighbour-mask paths: keep only positions not within `GRID_PPM`
+/// of `f`'s own isotope grid (`mono_mz + k·spacing`, `k ∈ [-1, kmax+2]`).
+fn filter_off_own_grid(raw: Vec<f64>, f: &DetectedFeature) -> Vec<f64> {
+    const GRID_PPM: f64 = 15.0;
+    let spacing = C13_MINUS_C12 / f.charge.max(1) as f64;
+    let kmax = f.num_isotopes_observed as i32 + 2;
+    raw.into_iter()
+        .filter(|&p| {
+            !(-1..=kmax).any(|k| {
+                let own = f.mono_mz + k as f64 * spacing;
+                (p - own).abs() / p * 1e6 <= GRID_PPM
+            })
+        })
+        .collect()
+}
+
 /// Derives a sibling output path from the final path: `out.tsv` + tag `detected` -> `out.detected.tsv`.
 fn sibling(out: &str, tag: &str) -> String {
     match out.strip_suffix(".tsv") {
@@ -310,7 +374,10 @@ fn main() {
     // against those corrected placements). NEIGHBOR_MIN_RATIO (default 5.0) = only defer to neighbours
     // at least that many times more intense — a weak feature in a strong neighbour's shadow.
     let neighbor_mode = std::env::var("NEIGHBOR_REFINE").ok();
-    let neighbor_refine = use_shift && neighbor_mode.is_some();
+    // "iterative": refine in descending-score order, each feature locking its corrected grid so later
+    // (lower-scoring) features mask its peaks. The confident features claim their signal first.
+    let iterative = use_shift && neighbor_mode.as_deref() == Some("iterative");
+    let neighbor_refine = use_shift && !iterative && neighbor_mode.is_some();
     let neighbor_refined_context = neighbor_mode.as_deref() == Some("refined");
     let neighbor_min_ratio = std::env::var("NEIGHBOR_MIN_RATIO")
         .ok()
@@ -342,28 +409,74 @@ fn main() {
     let t2 = Instant::now();
     let mut refined: Vec<RefinedFeature> = Vec::with_capacity(detected.len());
     let progress_every = 1000usize;
-    for (i, f) in detected.iter().enumerate() {
-        let r = if let Some(idx) = &neighbor_idx {
-            let mask = neighbor_mask_for(idx, f, neighbor_min_ratio);
-            refine_feature_shift_neighbor(f, &scans, &avg, 20.0, use_shift_apex, recharge, &mask)
-        } else if use_shift {
-            refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge)
-        } else if censor_claimed {
-            refine_feature_censored(f, &scans, &avg, &decon, &all_claimed)
-        } else {
-            refine_feature(f, &scans, &avg, &decon)
-        };
-        if let Some(r) = r {
-            refined.push(r);
+    if iterative {
+        // Only features whose fit clears this bar lock their grid into the mask — "higher-scoring"
+        // is not enough; a mediocre-but-higher feature is still uncertain and would add collateral.
+        let lock_min_score = std::env::var("NEIGHBOR_LOCK_MIN_SCORE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.9);
+        eprintln!("  NEIGHBOR_REFINE=iterative: score-ordered; only features with fit >= {lock_min_score} lock their grids");
+        // Pass 1: plain refine to get each feature's initial score.
+        let init: Vec<Option<RefinedFeature>> = detected
+            .iter()
+            .map(|f| refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge))
+            .collect();
+        // Process indices in descending initial score.
+        let mut order: Vec<usize> = (0..detected.len()).filter(|&i| init[i].is_some()).collect();
+        order.sort_by(|&a, &b| {
+            init[b].as_ref().unwrap().decon_score.total_cmp(&init[a].as_ref().unwrap().decon_score)
+        });
+        let mut locked = LockedGrids::new(0.05);
+        let mut out: Vec<Option<RefinedFeature>> = vec![None; detected.len()];
+        let mut n_locked = 0usize;
+        for (n, &i) in order.iter().enumerate() {
+            let f = &detected[i];
+            let spacing = C13_MINUS_C12 / f.charge.max(1) as f64;
+            let win_min = (f.mono_mz - 1.5).max(0.0);
+            let win_max = f.mono_mz + (f.num_isotopes_observed as f64 + 3.0) * spacing + 1.0;
+            let mask = filter_off_own_grid(locked.positions(f.apex_rt, win_min, win_max), f);
+            let r = refine_feature_shift_neighbor(f, &scans, &avg, 20.0, use_shift_apex, recharge, &mask)
+                .or_else(|| init[i].clone());
+            if let Some(rr) = &r {
+                // Only confident features become mask sources for the lower-scoring ones that follow.
+                if rr.decon_score >= lock_min_score {
+                    let mono_mz = mass_to_mz_f64(rr.refined_monoisotopic_mass, rr.refined_charge);
+                    let kmax = f.num_isotopes_observed as i32 + 2;
+                    locked.add(rr.detected.apex_rt, mono_mz, rr.refined_charge, kmax);
+                    n_locked += 1;
+                }
+            }
+            out[i] = r;
+            if (n + 1) % progress_every == 0 || n + 1 == order.len() {
+                eprintln!("    iterative refined {}/{} ({n_locked} locked)  [{:?}]", n + 1, order.len(), t2.elapsed());
+            }
         }
-        if (i + 1) % progress_every == 0 || i + 1 == detected.len() {
-            eprintln!(
-                "    refined {}/{} ({} kept)  [{:?}]",
-                i + 1,
-                detected.len(),
-                refined.len(),
-                t2.elapsed()
-            );
+        refined = out.into_iter().flatten().collect();
+    } else {
+        for (i, f) in detected.iter().enumerate() {
+            let r = if let Some(idx) = &neighbor_idx {
+                let mask = neighbor_mask_for(idx, f, neighbor_min_ratio);
+                refine_feature_shift_neighbor(f, &scans, &avg, 20.0, use_shift_apex, recharge, &mask)
+            } else if use_shift {
+                refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge)
+            } else if censor_claimed {
+                refine_feature_censored(f, &scans, &avg, &decon, &all_claimed)
+            } else {
+                refine_feature(f, &scans, &avg, &decon)
+            };
+            if let Some(r) = r {
+                refined.push(r);
+            }
+            if (i + 1) % progress_every == 0 || i + 1 == detected.len() {
+                eprintln!(
+                    "    refined {}/{} ({} kept)  [{:?}]",
+                    i + 1,
+                    detected.len(),
+                    refined.len(),
+                    t2.elapsed()
+                );
+            }
         }
     }
     let refine_dur = t2.elapsed();

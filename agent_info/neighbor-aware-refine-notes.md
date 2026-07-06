@@ -39,7 +39,14 @@ Assessment: **modest but real.** The neighbour-masking mostly overlaps failure m
 
 - **Exp A4: low-baseline-fit gating.** Mask only features whose unmasked fit < gate (`NEIGHBOR_FIT_GATE`). Gate 0.9 at ratio 2 → 601/582 (== ungated ratio 2); at ratio 5 → 603/585 (== ungated). **No-op** — the masking already only changes low-fit features, so gating on own-fit excludes nothing. The regression at low ratio is driven by NEIGHBOR STRENGTH (masking moderate 2–5× neighbours), not the feature's own fit, so ratio is the right knob and 5× is the ceiling. Reverted the gate (it doubled the flag-path cost for no gain).
 
-## Approaches NOT yet tried (for a deeper session)
-- **Down-weight vs hard-mask** shared peaks (competitive split by envelope expectation) — softer than the invisible mask; may reclaim the moderate-neighbour cases that regressed at low ratio.
-- **Off-by-one via neighbour coherence** — for a low-score feature, test whether its ±1 mono alternatives are better explained once neighbour-owned peaks are attributed away (targets YAA directly; the walk-back gate blocks YAA at 1640 Da, so this would need to run below the gate with neighbour protection against the M-1 grab).
-- **Strongest-first at the DETECTION stage** (not just refine) with claim hand-off — the greedy detector already claims tallest-first; propagating corrected claims into weaker features' windows.
+- **Exp B (user-requested): iterative score-ordered masking.** `NEIGHBOR_REFINE=iterative`: refine in descending pass-1 score; each feature that clears `NEIGHBOR_LOCK_MIN_SCORE` locks its corrected grid (`LockedGrids`, incremental RT-bucketed) so later lower-scoring features mask its peaks.
+  - lock ALL (threshold 0): 600/580 — regressed (a "higher-scoring" but mediocre feature is still uncertain; masking against it adds collateral, same as mask-all).
+  - lock ≥0.9: 601/582 · lock ≥0.95: 601/583. Asymptotes to baseline as the gate tightens; **never beats baseline 602/584, and below the intensity-dominance mask (603/585).**
+  - **Lesson:** for masking, "who owns this shared peak" is answered by **intensity dominance**, not refinement confidence/order. A confident-but-weak neighbour doesn't own a peak the current feature might legitimately share. Intensity-ratio single-pass (≥5×) remains the masking winner.
+
+## Strategy 2 (user-requested): joint linear model for residual low-score features
+Instead of masking, for features still scoring poorly after refinement: fit two+ overlapping envelopes SIMULTANEOUSLY — adjust position (mono shift) + intensity (amplitude via non-negative least squares) to maximise the combined fit. This is the "match multiple envelopes simultaneously" advanced decon from the original request. In progress.
+
+## Approaches NOT yet tried
+- **Down-weight vs hard-mask** shared peaks (competitive split) — softer than the invisible mask.
+- **Off-by-one via neighbour coherence** for the sub-walk-back-gate class (YAA).
