@@ -16,7 +16,8 @@ use std::time::Instant;
 
 use flashlfq_core::deconvolution::{ClassicDeconvolutionParameters, Polarity};
 use flashlfq_core::feature_refinement::{
-    refine_feature, resolve_charge_state_consensus, RefinedFeature, ResolvedFeature,
+    four_way_decon, refine_feature, resolve_charge_state_consensus, DeconView, FourWayDecon,
+    RefinedFeature, ResolvedFeature,
 };
 use flashlfq_core::isotopic_envelope::mass_to_mz_f64;
 use flashlfq_core::peak_indexing::{read_ms1_scans, PeakIndexingEngine};
@@ -270,6 +271,18 @@ fn main() {
     write_refined_tsv(&refined_path, &refined);
     eprintln!("  wrote {} refined features -> {refined_path}", refined.len());
 
+    // --- four-way decon comparator (opt-in diagnostic) -----------------------------------------
+    // FOUR_WAY_DECON=1 runs the classic×shift on composite×apex comparator over every detected
+    // feature, reporting how often the four monoisotope views disagree (→ candidates for advanced
+    // multi-envelope decon) and writing a per-feature disagreements TSV. Gated because it roughly
+    // doubles the decon cost; off by default so normal runs are unaffected.
+    if std::env::var("FOUR_WAY_DECON").is_ok() {
+        let t_fw = Instant::now();
+        let fw_path = sibling(out_path, "disagreements");
+        run_four_way(&detected, &scans, &avg, &decon, &fw_path);
+        timings.push(("four-way decon".into(), t_fw.elapsed().as_secs_f64()));
+    }
+
     // --- resolve charge-state consensus --------------------------------------------------------
     let t3 = Instant::now();
     let resolved = resolve_charge_state_consensus(&refined, 10.0, 0.1);
@@ -325,6 +338,89 @@ fn main() {
         }
         Err(e) => eprintln!("  WARN: could not write timing log {log_path} ({e})"),
     }
+}
+
+/// Runs the four-way decon comparator over every detected feature, reports the disagreement rate to
+/// the chat, and writes a per-disagreeing-feature TSV (the candidates for advanced multi-envelope
+/// decon). `decon` uses the pipeline's classic parameters; the shift views use a 20 ppm match tol.
+fn run_four_way(
+    detected: &[DetectedFeature],
+    scans: &[flashlfq_core::peak_indexing::Scan],
+    avg: &flashlfq_core::spectral_averaging::SpectralAveragingParameters,
+    decon: &ClassicDeconvolutionParameters,
+    path: &str,
+) {
+    let short = |v: DeconView| match v {
+        DeconView::ClassicComposite => "cc",
+        DeconView::ClassicApex => "ca",
+        DeconView::ShiftComposite => "sc",
+        DeconView::ShiftApex => "sa",
+    };
+
+    let mut w = open_out(path);
+    if let Some(w) = w.as_mut() {
+        writeln!(
+            w,
+            "Detector Mono\tCharge\tApex RT\tConsensus k\tNum Verdicts\tViews (view:k:conf)"
+        )
+        .unwrap();
+    }
+
+    let mut total = 0usize; // features that produced >=1 verdict
+    let mut with_verdicts_hist = [0usize; 5]; // count by number of verdicts (0..=4)
+    let mut unanimous = 0usize;
+    let mut disagreed = 0usize;
+    for f in detected {
+        let fw: FourWayDecon = four_way_decon(f, scans, avg, decon, 20.0);
+        with_verdicts_hist[fw.verdicts.len().min(4)] += 1;
+        if fw.verdicts.is_empty() {
+            continue;
+        }
+        total += 1;
+        if fw.needs_advanced {
+            disagreed += 1;
+            if let Some(w) = w.as_mut() {
+                let views: Vec<String> = fw
+                    .verdicts
+                    .iter()
+                    .map(|v| format!("{}:{:+}:{}", short(v.view), v.offset_k, if v.confident { 1 } else { 0 }))
+                    .collect();
+                writeln!(
+                    w,
+                    "{:.5}\t{}\t{:.4}\t{}\t{}\t{}",
+                    fw.detector_mono,
+                    fw.charge,
+                    f.apex_rt,
+                    fw.consensus_k.map(|k| k.to_string()).unwrap_or_default(),
+                    fw.verdicts.len(),
+                    views.join(" ")
+                )
+                .unwrap();
+            }
+        } else {
+            unanimous += 1;
+        }
+    }
+    if let Some(mut w) = w {
+        let _ = w.flush();
+    }
+
+    eprintln!("\n=== four-way decon comparator ===");
+    eprintln!("  detected features: {}", detected.len());
+    eprintln!(
+        "  produced >=1 verdict: {} (verdict-count histogram [0..4]: {:?})",
+        total, with_verdicts_hist
+    );
+    eprintln!(
+        "  unanimous (confident placement): {} ({:.1}%)",
+        unanimous,
+        100.0 * unanimous as f64 / total.max(1) as f64
+    );
+    eprintln!(
+        "  disagreed (→ advanced multi-envelope): {} ({:.1}%)  → {path}",
+        disagreed,
+        100.0 * disagreed as f64 / total.max(1) as f64
+    );
 }
 
 /// Writes the raw detected features (pre-refinement, straight from the trace kernel) to a TSV,

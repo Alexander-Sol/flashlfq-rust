@@ -36,6 +36,7 @@
 //!   charges" is softened to "the max-support cluster" (design's "≥2 charges, weighted by support").
 
 use crate::deconvolution::{classic_deconvolute, ClassicDeconvolutionParameters};
+use crate::isotope_shift_decon::shift_decon_in_window;
 use crate::isotopic_envelope::{mass_to_mz_f64, C13_MINUS_C12};
 use crate::peak_indexing::Scan;
 use crate::spectral_averaging::{average_spectra, SpectralAveragingParameters};
@@ -199,6 +200,352 @@ pub fn refine_feature(
         candidate_masses: best.monoisotopic_mass_predictions.clone(),
         decon_score: best.score,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Four-way decon comparator
+// ---------------------------------------------------------------------------
+//
+// Runs two deconvolution *strategies* — the parity-gated classic `classic_deconvolute` and the
+// untargeted FlashLFQ-style [`crate::isotope_shift_decon`] — over two *spectrum views* — the
+// averaged apex±3 composite and the single apex scan — giving up to **four** monoisotope verdicts
+// for one detected feature. When the four agree (same integer ¹³C offset) the placement is
+// confident; when they disagree the feature is flagged for a more advanced multi-envelope decon
+// (the disagreement is the signal that a single averagine envelope does not explain the window —
+// typically a chimeric region). See the `isotope-shift-decon` validation: classic and shift can
+// each be individually fooled, and heavy peptides can be *unanimously* wrong, so this comparator
+// deliberately triggers on **disagreement only**; unanimous-but-wrong is left to the downstream
+// cross-charge consensus, which is the correct backstop for the heavy-peptide case.
+
+/// Which of the four strategy×view combinations produced a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeconView {
+    /// Classic deconvolution on the averaged apex±3 composite (what [`refine_feature`] uses).
+    ClassicComposite,
+    /// Classic deconvolution on the single apex scan.
+    ClassicApex,
+    /// FlashLFQ-style shift decon on the averaged composite.
+    ShiftComposite,
+    /// FlashLFQ-style shift decon on the single apex scan.
+    ShiftApex,
+}
+
+/// One monoisotope verdict from a single [`DeconView`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeconVerdict {
+    /// Which strategy×view produced this.
+    pub view: DeconView,
+    /// The monoisotopic neutral mass this view placed the feature at.
+    pub monoisotopic_mass: f64,
+    /// Charge state (equals the detected charge).
+    pub charge: i32,
+    /// Integer ¹³C offset of this verdict's mono from the detector's coarse mono
+    /// (`round((mono − detector_mono) / C13)`); the quantity the four views are compared on.
+    pub offset_k: i32,
+    /// Confidence for this view: classic views are confident when an envelope at the detected
+    /// charge was picked; shift views are confident when the shift-0 acceptance gate passed. A
+    /// gate-failing / unpicked view still contributes an `offset_k` but a low-confidence one.
+    pub confident: bool,
+    /// Classic decon score, or (for shift views) the winning shift's Pearson correlation.
+    pub score: f64,
+}
+
+/// The four-way decon comparison for one feature.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FourWayDecon {
+    /// The detector's coarse monoisotopic mass (the reference the offsets are measured against).
+    pub detector_mono: f64,
+    /// The feature's charge state.
+    pub charge: i32,
+    /// The verdicts that were produced (0–4; a view is omitted when its decon yields nothing).
+    pub verdicts: Vec<DeconVerdict>,
+    /// Whether every produced verdict shares the same [`offset_k`](DeconVerdict::offset_k).
+    pub unanimous: bool,
+    /// The agreed offset when unanimous, else the plurality offset (ties broken toward the most
+    /// confident, then the smallest offset). `None` only when no verdict was produced.
+    pub consensus_k: Option<i32>,
+    /// Consensus monoisotopic mass to adopt when *not* routing to advanced decon: the mean mass of
+    /// the verdicts at [`consensus_k`](Self::consensus_k). `None` when no verdict was produced.
+    pub consensus_mono: Option<f64>,
+    /// `true` when the produced verdicts disagree on the offset — route to advanced multi-envelope
+    /// decon. `false` for unanimous (or single/empty) results.
+    pub needs_advanced: bool,
+}
+
+/// Locally sliced composite + apex spectra for one feature, plus the deconvolution m/z range.
+struct FeatureSlices {
+    comp_mz: Vec<f64>,
+    comp_int: Vec<f64>,
+    apex_mz: Vec<f64>,
+    apex_int: Vec<f64>,
+    /// Classic-decon range floor for the composite (`range_min0` clamped to the composite's first peak).
+    range_min_comp: f64,
+    /// Classic-decon range floor for the apex slice.
+    range_min_apex: f64,
+    /// Shared upper m/z bound of the envelope window; also the anchor-search upper bound for shift decon.
+    range_max: f64,
+    /// Lower bound of the anchor-search window for shift decon (`range_min0`, unclamped).
+    anchor_min: f64,
+}
+
+/// Builds the averaged apex±3 composite and the apex-scan slice for a feature, over the same m/z
+/// window [`refine_feature`] uses. Returns `None` on the same degenerate conditions
+/// (`refine_feature` would also return `None`): empty scans/peaks, empty window, or empty composite.
+fn build_feature_slices(
+    feature: &DetectedFeature,
+    scans: &[Scan],
+    averaging_params: &SpectralAveragingParameters,
+) -> Option<FeatureSlices> {
+    if scans.is_empty() || feature.peaks.is_empty() {
+        return None;
+    }
+    let apex = feature.apex_scan_index;
+    let half = (MAX_SCANS_TO_AVERAGE / 2) as i32;
+    let lo = (apex - half).max(0) as usize;
+    let hi = ((apex + half).max(0) as usize).min(scans.len() - 1);
+    if lo > hi {
+        return None;
+    }
+
+    let spacing = C13_MINUS_C12 / feature.charge as f64;
+    let range_min0 = (feature.mono_mz - 1.5).max(0.0);
+    let range_max = feature.mono_mz + (feature.num_isotopes_observed as f64 + 3.0) * spacing + 1.0;
+    let slice_lo = range_min0 - 0.5;
+    let slice_hi = range_max + 0.5;
+
+    let window = &scans[lo..=hi];
+    let mut x_arrays: Vec<Vec<f64>> = Vec::with_capacity(window.len());
+    let mut y_arrays: Vec<Vec<f64>> = Vec::with_capacity(window.len());
+    for s in window {
+        let a = s.mz.partition_point(|&m| m < slice_lo);
+        let b = s.mz.partition_point(|&m| m <= slice_hi);
+        x_arrays.push(s.mz[a..b].to_vec());
+        y_arrays.push(s.intensity[a..b].to_vec());
+    }
+    if x_arrays.iter().all(|x| x.is_empty()) {
+        return None;
+    }
+
+    let (comp_mz, comp_int) = average_spectra(&x_arrays, &y_arrays, averaging_params);
+    if comp_mz.is_empty() {
+        return None;
+    }
+    let range_min_comp = range_min0.max(comp_mz[0]);
+
+    // Apex-scan slice over the same m/z window.
+    let apex_usize = (feature.apex_scan_index.max(0) as usize).min(scans.len() - 1);
+    let ascan = &scans[apex_usize];
+    let a = ascan.mz.partition_point(|&m| m < slice_lo);
+    let b = ascan.mz.partition_point(|&m| m <= slice_hi);
+    let apex_mz = ascan.mz[a..b].to_vec();
+    let apex_int = ascan.intensity[a..b].to_vec();
+    let range_min_apex = range_min0.max(apex_mz.first().copied().unwrap_or(range_min0));
+
+    Some(FeatureSlices {
+        comp_mz,
+        comp_int,
+        apex_mz,
+        apex_int,
+        range_min_comp,
+        range_min_apex,
+        range_max,
+        anchor_min: range_min0,
+    })
+}
+
+/// Runs `classic_deconvolute` on a slice and returns the (mono, score) of the envelope at the
+/// feature's charge whose mono m/z is closest to the feature's — the same pick [`refine_feature`]
+/// makes. `None` when the slice is too small or no envelope matches the charge.
+fn pick_classic_mono(
+    mz: &[f64],
+    inten: &[f64],
+    feature: &DetectedFeature,
+    range_min: f64,
+    range_max: f64,
+    decon_params: &ClassicDeconvolutionParameters,
+) -> Option<(f64, f64)> {
+    if mz.len() < 2 {
+        return None;
+    }
+    classic_deconvolute(mz, inten, range_min, range_max, decon_params)
+        .into_iter()
+        .filter(|e| e.charge == feature.charge)
+        .min_by(|a, b| {
+            let da = (mass_to_mz_f64(a.monoisotopic_mass, a.charge) - feature.mono_mz).abs();
+            let db = (mass_to_mz_f64(b.monoisotopic_mass, b.charge) - feature.mono_mz).abs();
+            da.total_cmp(&db)
+        })
+        .map(|e| (e.monoisotopic_mass, e.score))
+}
+
+/// Builds a [`DeconVerdict`], computing the integer ¹³C offset from the detector's coarse mono.
+fn make_verdict(
+    view: DeconView,
+    mono: f64,
+    charge: i32,
+    detector_mono: f64,
+    confident: bool,
+    score: f64,
+) -> DeconVerdict {
+    let offset_k = ((mono - detector_mono) / C13_MINUS_C12).round() as i32;
+    DeconVerdict {
+        view,
+        monoisotopic_mass: mono,
+        charge,
+        offset_k,
+        confident,
+        score,
+    }
+}
+
+/// Runs the four decon views for one detected feature and compares their monoisotope placements.
+///
+/// The two composite views reuse the exact averaging window and pick logic of [`refine_feature`];
+/// the two apex views run on the single apex scan. `shift_tol_ppm` is the ppm tolerance for the
+/// shift-decon peak matching (the classic views use `decon_params`).
+pub fn four_way_decon(
+    feature: &DetectedFeature,
+    scans: &[Scan],
+    averaging_params: &SpectralAveragingParameters,
+    decon_params: &ClassicDeconvolutionParameters,
+    shift_tol_ppm: f64,
+) -> FourWayDecon {
+    let detector_mono = feature.monoisotopic_mass;
+    let charge = feature.charge;
+    let mut verdicts: Vec<DeconVerdict> = Vec::new();
+
+    if let Some(s) = build_feature_slices(feature, scans, averaging_params) {
+        // Classic composite.
+        if let Some((mono, score)) = pick_classic_mono(
+            &s.comp_mz,
+            &s.comp_int,
+            feature,
+            s.range_min_comp,
+            s.range_max,
+            decon_params,
+        ) {
+            verdicts.push(make_verdict(
+                DeconView::ClassicComposite,
+                mono,
+                charge,
+                detector_mono,
+                true,
+                score,
+            ));
+        }
+        // Classic apex.
+        if let Some((mono, score)) = pick_classic_mono(
+            &s.apex_mz,
+            &s.apex_int,
+            feature,
+            s.range_min_apex,
+            s.range_max,
+            decon_params,
+        ) {
+            verdicts.push(make_verdict(
+                DeconView::ClassicApex,
+                mono,
+                charge,
+                detector_mono,
+                true,
+                score,
+            ));
+        }
+        // Shift composite.
+        if let Some(r) =
+            shift_decon_in_window(&s.comp_mz, &s.comp_int, s.anchor_min, s.range_max, charge, shift_tol_ppm)
+        {
+            verdicts.push(make_verdict(
+                DeconView::ShiftComposite,
+                r.monoisotopic_mass,
+                charge,
+                detector_mono,
+                r.shift0_passes_gate,
+                r.shift_correlations[1],
+            ));
+        }
+        // Shift apex.
+        if let Some(r) =
+            shift_decon_in_window(&s.apex_mz, &s.apex_int, s.anchor_min, s.range_max, charge, shift_tol_ppm)
+        {
+            verdicts.push(make_verdict(
+                DeconView::ShiftApex,
+                r.monoisotopic_mass,
+                charge,
+                detector_mono,
+                r.shift0_passes_gate,
+                r.shift_correlations[1],
+            ));
+        }
+    }
+
+    analyze_agreement(detector_mono, charge, verdicts)
+}
+
+/// Tallies the verdicts' integer offsets, decides unanimity / plurality, and assembles the
+/// [`FourWayDecon`]. Unanimous ⇔ all produced verdicts share one offset. When not unanimous the
+/// plurality offset wins (ties → most confident verdicts at that offset, then smallest offset), and
+/// `needs_advanced` is set. `consensus_mono` is the mean mass of the verdicts at the chosen offset.
+fn analyze_agreement(
+    detector_mono: f64,
+    charge: i32,
+    verdicts: Vec<DeconVerdict>,
+) -> FourWayDecon {
+    if verdicts.is_empty() {
+        return FourWayDecon {
+            detector_mono,
+            charge,
+            verdicts,
+            unanimous: false,
+            consensus_k: None,
+            consensus_mono: None,
+            needs_advanced: false,
+        };
+    }
+
+    // Distinct offsets present.
+    let first_k = verdicts[0].offset_k;
+    let unanimous = verdicts.iter().all(|v| v.offset_k == first_k);
+
+    // Per-offset tally: (count, confident-count) keyed by offset.
+    let mut tally: HashMap<i32, (usize, usize)> = HashMap::new();
+    for v in &verdicts {
+        let e = tally.entry(v.offset_k).or_insert((0, 0));
+        e.0 += 1;
+        if v.confident {
+            e.1 += 1;
+        }
+    }
+    // Plurality: most verdicts, then most confident, then smallest offset.
+    let consensus_k = tally
+        .iter()
+        .max_by(|a, b| {
+            // a, b: (&offset, &(count, confident_count))
+            a.1 .0
+                .cmp(&b.1 .0) // count
+                .then(a.1 .1.cmp(&b.1 .1)) // confident count
+                .then(b.0.cmp(a.0)) // smaller offset wins (reversed so it ranks as "greater")
+        })
+        .map(|(k, _)| *k);
+
+    let consensus_mono = consensus_k.map(|k| {
+        let masses: Vec<f64> = verdicts
+            .iter()
+            .filter(|v| v.offset_k == k)
+            .map(|v| v.monoisotopic_mass)
+            .collect();
+        masses.iter().sum::<f64>() / masses.len() as f64
+    });
+
+    FourWayDecon {
+        detector_mono,
+        charge,
+        verdicts,
+        unanimous,
+        consensus_k,
+        consensus_mono,
+        needs_advanced: !unanimous,
+    }
 }
 
 /// Resolves refined features into peptide features by grouping co-eluting charge states of the same
@@ -696,6 +1043,106 @@ mod tests {
             true_mass,
             ppm_of(r.monoisotopic_mass, true_mass)
         );
+    }
+
+    #[test]
+    fn four_way_unanimous_on_clean_synthetic_feature() {
+        // A clean single-charge envelope: all four views should place the mono at the same offset,
+        // so the result is unanimous and does NOT route to advanced decon.
+        let (scans, _mono_mz, mono_mass) = synthetic_envelope_scans();
+        let engine = PeakIndexingEngine::index_peaks(&scans).expect("indexed");
+        let det_params = TraceKernelParameters {
+            ppm_tolerance: 5.0,
+            rt_sigma_minutes: 0.15,
+            half_window_scans: 4,
+            ..TraceKernelParameters::default()
+        };
+        let features = detect_features(&engine, &det_params);
+        let feature = &features[0];
+
+        let avg = SpectralAveragingParameters::default();
+        let decon = ClassicDeconvolutionParameters::new(1, 6, 20.0, 3.0, Polarity::Positive);
+        let fw = four_way_decon(feature, &scans, &avg, &decon, 20.0);
+
+        assert!(!fw.verdicts.is_empty(), "clean feature should yield verdicts");
+        assert!(fw.unanimous, "clean feature: all views agree (verdicts={:?})", fw.verdicts);
+        assert!(!fw.needs_advanced, "unanimous ⇒ not routed to advanced");
+        let mono = fw.consensus_mono.expect("consensus mono present");
+        assert!(
+            ppm_of(mono, mono_mass) <= 30.0,
+            "consensus mono {} not within 30 ppm of {} (ppm={})",
+            mono,
+            mono_mass,
+            ppm_of(mono, mono_mass)
+        );
+    }
+
+    /// Builds a `DeconVerdict` directly for agreement-logic tests.
+    fn verdict(view: DeconView, offset_k: i32, confident: bool) -> DeconVerdict {
+        let detector_mono = 1000.0;
+        let mono = detector_mono + offset_k as f64 * C13_MINUS_C12;
+        DeconVerdict {
+            view,
+            monoisotopic_mass: mono,
+            charge: 2,
+            offset_k,
+            confident,
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn agreement_unanimous_when_all_offsets_match() {
+        let vs = vec![
+            verdict(DeconView::ClassicComposite, 0, true),
+            verdict(DeconView::ClassicApex, 0, true),
+            verdict(DeconView::ShiftComposite, 0, true),
+            verdict(DeconView::ShiftApex, 0, false),
+        ];
+        let fw = analyze_agreement(1000.0, 2, vs);
+        assert!(fw.unanimous);
+        assert!(!fw.needs_advanced);
+        assert_eq!(fw.consensus_k, Some(0));
+    }
+
+    #[test]
+    fn agreement_flags_disagreement_and_takes_plurality() {
+        // Three views say k=0, one says k=-1 ⇒ disagreement (advanced) with plurality k=0.
+        let vs = vec![
+            verdict(DeconView::ClassicComposite, -1, true),
+            verdict(DeconView::ClassicApex, 0, true),
+            verdict(DeconView::ShiftComposite, 0, true),
+            verdict(DeconView::ShiftApex, 0, false),
+        ];
+        let fw = analyze_agreement(1000.0, 2, vs);
+        assert!(!fw.unanimous);
+        assert!(fw.needs_advanced, "disagreement must route to advanced");
+        assert_eq!(fw.consensus_k, Some(0), "plurality offset is 0");
+        // consensus_mono is the mean of the three k=0 masses (all identical here).
+        let expected = 1000.0;
+        assert!((fw.consensus_mono.unwrap() - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn agreement_tie_breaks_toward_confident_then_smaller_offset() {
+        // Two offsets each with one verdict; the +1 one is confident, the -1 one is not.
+        // Equal count ⇒ confident count breaks the tie ⇒ +1 wins even though it is the larger offset.
+        let vs = vec![
+            verdict(DeconView::ClassicComposite, 1, true),
+            verdict(DeconView::ShiftComposite, -1, false),
+        ];
+        let fw = analyze_agreement(1000.0, 2, vs);
+        assert!(!fw.unanimous);
+        assert_eq!(fw.consensus_k, Some(1), "confident offset wins the tie");
+    }
+
+    #[test]
+    fn agreement_empty_is_not_advanced() {
+        let fw = analyze_agreement(1000.0, 2, Vec::new());
+        assert!(!fw.unanimous);
+        assert!(!fw.needs_advanced);
+        assert_eq!(fw.consensus_k, None);
+        assert_eq!(fw.consensus_mono, None);
     }
 
     #[test]

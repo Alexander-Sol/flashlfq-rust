@@ -35,7 +35,7 @@
 //! parity-ported [`crate::isotopic_envelope::pearson`] FlashLFQ uses.
 
 use crate::deconvolution::averagine_comb_weights;
-use crate::isotopic_envelope::{mass_to_mz_f64, pearson, C13_MINUS_C12, PROTON_MASS};
+use crate::isotopic_envelope::{pearson, C13_MINUS_C12, PROTON_MASS};
 
 /// Relative weight below which the averagine template's descending high-mass tail is dropped
 /// (passed to [`averagine_comb_weights`]). Teeth up to and including the mode are always kept.
@@ -243,6 +243,7 @@ pub fn shift_decon_in_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::isotopic_envelope::mass_to_mz_f64;
 
     fn ppm_diff(a: f64, b: f64) -> f64 {
         (a - b).abs() / b * 1e6
