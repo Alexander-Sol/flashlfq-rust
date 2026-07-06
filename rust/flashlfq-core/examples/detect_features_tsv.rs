@@ -17,8 +17,9 @@ use std::time::Instant;
 use flashlfq_core::deconvolution::{ClassicDeconvolutionParameters, Polarity};
 use flashlfq_core::feature_refinement::{
     four_way_decon, four_way_decon_detector_anchor, four_way_decon_gated, refine_feature,
-    refine_feature_censored, refine_feature_shift, resolve_charge_state_consensus, DeconView,
-    FourWayDecon, NeighborIndex, RefinedFeature, ResolvedFeature,
+    refine_feature_censored, refine_feature_shift, refine_feature_shift_neighbor,
+    resolve_charge_state_consensus, DeconView, FourWayDecon, NeighborIndex, RefinedFeature,
+    ResolvedFeature,
 };
 use flashlfq_core::isotopic_envelope::{mass_to_mz_f64, C13_MINUS_C12};
 use flashlfq_core::peak_indexing::{read_ms1_scans, PeakIndexingEngine, PeakKey};
@@ -26,6 +27,29 @@ use flashlfq_core::trace_kernel::{
     detect_features, estimate_noise_floor, median_ms1_scan_spacing_minutes, CombWeightModel,
     DetectedFeature, ScoreModel, TraceKernelParameters, FWHM_TO_SIGMA,
 };
+
+/// Neighbour isotope-m/z positions in feature `f`'s window that are **not** on its own grid — the peaks
+/// to mask from its shift fit (`NEIGHBOR_REFINE`). Own grid = `mono_mz + k·spacing`, `k ∈ [-1, kmax+2]`.
+/// Only neighbours at least `min_ratio ×` this feature's intensity contribute (defer to stronger
+/// species only). `idx` may be built from detected OR refined features; querying by `f.apex_rt` avoids
+/// any self-index alignment, and `min_ratio > 1` guarantees a feature never masks its own peaks.
+fn neighbor_mask_for(idx: &NeighborIndex, f: &DetectedFeature, min_ratio: f64) -> Vec<f64> {
+    const GRID_PPM: f64 = 15.0;
+    let spacing = C13_MINUS_C12 / f.charge.max(1) as f64;
+    let win_min = (f.mono_mz - 1.5).max(0.0);
+    let win_max = f.mono_mz + (f.num_isotopes_observed as f64 + 3.0) * spacing + 1.0;
+    let kmax = f.num_isotopes_observed as i32 + 2;
+    let min_intensity = f.summed_intensity * min_ratio;
+    idx.forbidden_positions_query(f.apex_rt, win_min, win_max, min_intensity)
+        .into_iter()
+        .filter(|&p| {
+            !(-1..=kmax).any(|k| {
+                let own = f.mono_mz + k as f64 * spacing;
+                (p - own).abs() / p * 1e6 <= GRID_PPM
+            })
+        })
+        .collect()
+}
 
 /// Derives a sibling output path from the final path: `out.tsv` + tag `detected` -> `out.detected.tsv`.
 fn sibling(out: &str, tag: &str) -> String {
@@ -278,11 +302,51 @@ fn main() {
         .unwrap_or(true);
     eprintln!("  refine method: {refine_method}{}", if recharge && use_shift { " + recharge (envelope-fit cosine)" } else { "" });
 
+    // NEIGHBOR_REFINE=1: mask co-eluting neighbours' peaks (off this feature's own grid) from the
+    // charge-selection fit, walk-back and score — so a low-scoring feature in a crowded window is judged
+    // on the signal plausibly its own. Experiment path; builds a NeighborIndex over the detections.
+    // NEIGHBOR_REFINE: mask co-eluting neighbours' peaks from the shift fit. Value picks the neighbour
+    // context: "detected"/"1" = raw detections; "refined" = a two-pass build (refine once, then mask
+    // against those corrected placements). NEIGHBOR_MIN_RATIO (default 5.0) = only defer to neighbours
+    // at least that many times more intense — a weak feature in a strong neighbour's shadow.
+    let neighbor_mode = std::env::var("NEIGHBOR_REFINE").ok();
+    let neighbor_refine = use_shift && neighbor_mode.is_some();
+    let neighbor_refined_context = neighbor_mode.as_deref() == Some("refined");
+    let neighbor_min_ratio = std::env::var("NEIGHBOR_MIN_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(5.0);
+    let neighbor_idx = if neighbor_refine {
+        let src = if neighbor_refined_context {
+            // Pass 1: plain refine, then index the corrected placements for the masked pass below.
+            let pass1: Vec<RefinedFeature> = detected
+                .iter()
+                .filter_map(|f| refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge))
+                .collect();
+            eprintln!(
+                "  NEIGHBOR_REFINE=refined: two-pass, masking neighbours >= {neighbor_min_ratio}x (from {} refined)",
+                pass1.len()
+            );
+            NeighborIndex::build_from_refined(&pass1, 0.05)
+        } else {
+            eprintln!(
+                "  NEIGHBOR_REFINE: masking peaks of co-eluting detected neighbours >= {neighbor_min_ratio}x this feature's intensity"
+            );
+            NeighborIndex::build(&detected, 0.05)
+        };
+        Some(src)
+    } else {
+        None
+    };
+
     let t2 = Instant::now();
     let mut refined: Vec<RefinedFeature> = Vec::with_capacity(detected.len());
     let progress_every = 1000usize;
     for (i, f) in detected.iter().enumerate() {
-        let r = if use_shift {
+        let r = if let Some(idx) = &neighbor_idx {
+            let mask = neighbor_mask_for(idx, f, neighbor_min_ratio);
+            refine_feature_shift_neighbor(f, &scans, &avg, 20.0, use_shift_apex, recharge, &mask)
+        } else if use_shift {
             refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge)
         } else if censor_claimed {
             refine_feature_censored(f, &scans, &avg, &decon, &all_claimed)

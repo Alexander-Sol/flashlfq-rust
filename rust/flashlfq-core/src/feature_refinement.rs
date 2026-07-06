@@ -37,8 +37,9 @@
 
 use crate::deconvolution::{classic_deconvolute, ClassicDeconvolutionParameters};
 use crate::isotope_shift_decon::{
-    best_charge_by_fit, envelope_fit_cosine, shift_decon, shift_decon_gated, shift_decon_in_window,
-    walkback_mono_high_charge, RECHARGE_PREFER_MARGIN,
+    best_charge_by_fit, envelope_fit_cosine_masked, shift_decon, shift_decon_gated,
+    shift_decon_in_window, walkback_mono_high_charge, NEIGHBOR_MASK_PPM, RECHARGE_PREFER_MARGIN,
+
 };
 use crate::isotopic_envelope::{mass_to_mz_f64, C13_MINUS_C12};
 use crate::peak_indexing::{PeakKey, Scan};
@@ -140,6 +141,54 @@ pub fn refine_feature_shift(
     use_apex: bool,
     recharge: bool,
 ) -> Option<RefinedFeature> {
+    refine_feature_shift_inner(
+        feature,
+        scans,
+        averaging_params,
+        shift_tol_ppm,
+        use_apex,
+        recharge,
+        &[],
+    )
+}
+
+/// **Neighbour-aware** [`refine_feature_shift`]: `neighbor_mz` is the ascending isotope m/z of
+/// co-eluting *other* features that are **not** on this feature's own grid (from [`NeighborIndex`]).
+/// Those peaks are masked from the charge-selection fit, the walk-back and the reported score, so a
+/// low-scoring feature in a crowded window is judged on the signal plausibly its own — a competing
+/// charge cannot borrow a neighbour's peaks (the z↔2z harmonic), and the walk-back cannot anchor on a
+/// neighbour's peak. Experiment path (pipeline `NEIGHBOR_REFINE`). With `neighbor_mz` empty this is
+/// exactly [`refine_feature_shift`].
+pub fn refine_feature_shift_neighbor(
+    feature: &DetectedFeature,
+    scans: &[Scan],
+    averaging_params: &SpectralAveragingParameters,
+    shift_tol_ppm: f64,
+    use_apex: bool,
+    recharge: bool,
+    neighbor_mz: &[f64],
+) -> Option<RefinedFeature> {
+    refine_feature_shift_inner(
+        feature,
+        scans,
+        averaging_params,
+        shift_tol_ppm,
+        use_apex,
+        recharge,
+        neighbor_mz,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_feature_shift_inner(
+    feature: &DetectedFeature,
+    scans: &[Scan],
+    averaging_params: &SpectralAveragingParameters,
+    shift_tol_ppm: f64,
+    use_apex: bool,
+    recharge: bool,
+    neighbor_mz: &[f64],
+) -> Option<RefinedFeature> {
     let s = build_feature_slices(feature, scans, averaging_params)?;
     // Detector's own most-abundant claimed peak — the anchor that cannot grab a foreign peak.
     let anchor_mz = feature
@@ -166,6 +215,8 @@ pub fn refine_feature_shift(
             0.0,
             feature.charge,
             RECHARGE_PREFER_MARGIN,
+            neighbor_mz,
+            NEIGHBOR_MASK_PPM,
         )?;
         (z, mono)
     } else {
@@ -175,14 +226,32 @@ pub fn refine_feature_shift(
     // High-charge double-check: heavy peptides can seed the mono one or two ¹³C too high (the envelope
     // mode sits well above the mono), and the fit window never sees the unexplained peak beneath it.
     // Walk the mono back up to 2 ¹³C and keep the lowest that still fits (no-op for |z| < 4 / good mono).
-    let refined_mono =
-        walkback_mono_high_charge(mz, inten, refined_mono0, refined_charge, shift_tol_ppm, 0.0);
+    let refined_mono = walkback_mono_high_charge(
+        mz,
+        inten,
+        refined_mono0,
+        refined_charge,
+        shift_tol_ppm,
+        0.0,
+        neighbor_mz,
+        NEIGHBOR_MASK_PPM,
+    );
     Some(RefinedFeature {
         detected: feature.clone(),
         refined_monoisotopic_mass: refined_mono,
         refined_charge,
         candidate_masses: vec![refined_mono],
-        decon_score: envelope_fit_cosine(mz, inten, mass_to_mz_f64(refined_mono, refined_charge), refined_charge, shift_tol_ppm, 0.2, 0.0),
+        decon_score: envelope_fit_cosine_masked(
+            mz,
+            inten,
+            mass_to_mz_f64(refined_mono, refined_charge),
+            refined_charge,
+            shift_tol_ppm,
+            0.2,
+            0.0,
+            neighbor_mz,
+            NEIGHBOR_MASK_PPM,
+        ),
     })
 }
 
@@ -403,6 +472,8 @@ fn refine_feature_inner(
 pub struct NeighborIndex {
     /// One entry per feature (parallel to the input slice): `(apex_rt, mono_mz, spacing, kmax)`.
     grids: Vec<(f64, f64, f64, i32)>,
+    /// Per-feature summed intensity (parallel to `grids`), for stronger-neighbour filtering.
+    intensities: Vec<f64>,
     /// RT bin (`floor(apex_rt / rt_tol)`) → feature indices.
     buckets: HashMap<i64, Vec<usize>>,
     rt_tol: f64,
@@ -413,6 +484,7 @@ impl NeighborIndex {
     /// grid spans `k ∈ [0, num_isotopes_observed + 2]` (a little past the observed envelope).
     pub fn build(features: &[DetectedFeature], rt_tol: f64) -> Self {
         let mut grids = Vec::with_capacity(features.len());
+        let mut intensities = Vec::with_capacity(features.len());
         let mut buckets: HashMap<i64, Vec<usize>> = HashMap::new();
         let bin_of = |rt: f64| -> i64 { (rt / rt_tol).floor() as i64 };
         for (i, f) in features.iter().enumerate() {
@@ -423,9 +495,32 @@ impl NeighborIndex {
                 spacing,
                 f.num_isotopes_observed as i32 + 2,
             ));
+            intensities.push(f.summed_intensity);
             buckets.entry(bin_of(f.apex_rt)).or_default().push(i);
         }
-        NeighborIndex { grids, buckets, rt_tol }
+        NeighborIndex { grids, intensities, buckets, rt_tol }
+    }
+
+    /// Builds the index from **refined** features (their corrected mono m/z / charge), for a second
+    /// neighbour-aware refinement pass whose masks come from placements already corrected in pass one.
+    pub fn build_from_refined(refined: &[RefinedFeature], rt_tol: f64) -> Self {
+        let mut grids = Vec::with_capacity(refined.len());
+        let mut intensities = Vec::with_capacity(refined.len());
+        let mut buckets: HashMap<i64, Vec<usize>> = HashMap::new();
+        let bin_of = |rt: f64| -> i64 { (rt / rt_tol).floor() as i64 };
+        for (i, r) in refined.iter().enumerate() {
+            let spacing = C13_MINUS_C12 / r.refined_charge.max(1) as f64;
+            let mono_mz = mass_to_mz_f64(r.refined_monoisotopic_mass, r.refined_charge);
+            grids.push((
+                r.detected.apex_rt,
+                mono_mz,
+                spacing,
+                r.detected.num_isotopes_observed as i32 + 2,
+            ));
+            intensities.push(r.detected.summed_intensity);
+            buckets.entry(bin_of(r.detected.apex_rt)).or_default().push(i);
+        }
+        NeighborIndex { grids, intensities, buckets, rt_tol }
     }
 
     /// Ascending isotope m/z of every feature other than `self_idx` that co-elutes with it
@@ -436,13 +531,78 @@ impl NeighborIndex {
         win_min_mz: f64,
         win_max_mz: f64,
     ) -> Vec<f64> {
+        self.collect_positions(self_idx, win_min_mz, win_max_mz, 0.0)
+    }
+
+    /// Ascending isotope m/z of indexed features that co-elute with `query_rt` (`|Δrt| ≤ rt_tol`), are
+    /// at least `min_intensity` intense, and whose teeth fall in `[win_min_mz, win_max_mz]`. Unlike
+    /// [`forbidden_positions`](Self::forbidden_positions) this takes the query's RT directly (no
+    /// `self_idx`), for querying an index built from a *different* feature set (e.g. refined vs the
+    /// detected loop). A feature never masks its own peaks here as long as `min_intensity` exceeds its
+    /// own intensity — guaranteed when the caller uses a strength ratio > 1.
+    pub fn forbidden_positions_query(
+        &self,
+        query_rt: f64,
+        win_min_mz: f64,
+        win_max_mz: f64,
+        min_intensity: f64,
+    ) -> Vec<f64> {
+        let bin = (query_rt / self.rt_tol).floor() as i64;
+        let mut out: Vec<f64> = Vec::new();
+        for b in (bin - 1)..=(bin + 1) {
+            let Some(idxs) = self.buckets.get(&b) else { continue };
+            for &j in idxs {
+                if self.intensities[j] < min_intensity {
+                    continue;
+                }
+                let (rt, mono_mz, spacing, kmax) = self.grids[j];
+                if (rt - query_rt).abs() > self.rt_tol {
+                    continue;
+                }
+                for k in 0..=kmax {
+                    let m = mono_mz + k as f64 * spacing;
+                    if m < win_min_mz {
+                        continue;
+                    }
+                    if m > win_max_mz {
+                        break;
+                    }
+                    out.push(m);
+                }
+            }
+        }
+        out.sort_by(f64::total_cmp);
+        out
+    }
+
+    /// Like [`forbidden_positions`](Self::forbidden_positions) but only from neighbours whose summed
+    /// intensity is at least `min_ratio ×` this feature's — i.e. defer only to **stronger** co-eluting
+    /// species (a weak feature in a strong neighbour's shadow), never mask in favour of a weaker one.
+    pub fn forbidden_positions_stronger(
+        &self,
+        self_idx: usize,
+        win_min_mz: f64,
+        win_max_mz: f64,
+        min_ratio: f64,
+    ) -> Vec<f64> {
+        let min_intensity = self.intensities[self_idx] * min_ratio;
+        self.collect_positions(self_idx, win_min_mz, win_max_mz, min_intensity)
+    }
+
+    fn collect_positions(
+        &self,
+        self_idx: usize,
+        win_min_mz: f64,
+        win_max_mz: f64,
+        min_intensity: f64,
+    ) -> Vec<f64> {
         let (self_rt, ..) = self.grids[self_idx];
         let bin = (self_rt / self.rt_tol).floor() as i64;
         let mut out: Vec<f64> = Vec::new();
         for b in (bin - 1)..=(bin + 1) {
             let Some(idxs) = self.buckets.get(&b) else { continue };
             for &j in idxs {
-                if j == self_idx {
+                if j == self_idx || self.intensities[j] < min_intensity {
                     continue;
                 }
                 let (rt, mono_mz, spacing, kmax) = self.grids[j];

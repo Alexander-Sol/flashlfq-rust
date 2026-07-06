@@ -458,6 +458,35 @@ pub fn envelope_fit_cosine(
     min_rel: f64,
     noise_floor: f64,
 ) -> f64 {
+    envelope_fit_cosine_masked(
+        mz, intensity, mono_mz, charge, tol_ppm, min_rel, noise_floor, &[], 0.0,
+    )
+}
+
+/// ppm within which a window peak is considered to sit on an `excluded` (neighbour-owned) position.
+pub const NEIGHBOR_MASK_PPM: f64 = 12.0;
+
+/// [`envelope_fit_cosine`] with a **neighbour mask**: any observed window peak within `excl_ppm` of an
+/// `excluded` m/z (ascending) is made **invisible** to this fit — it can neither be matched to one of
+/// this envelope's predicted teeth nor counted as unexplained signal. `excluded` should be the isotope
+/// m/z of co-eluting *neighbour* features that are **not** on this feature's own grid.
+///
+/// This lets a low-scoring feature in a crowded window be judged on the signal that is plausibly *its
+/// own*: a competing charge that only "fits" by absorbing a neighbour's peaks (the z↔2z harmonic, whose
+/// intervening teeth are neighbour-filled) loses its borrowed evidence, and the walk-back cannot anchor
+/// the mono on a neighbour's peak. With `excluded` empty this is exactly [`envelope_fit_cosine`].
+#[allow(clippy::too_many_arguments)]
+pub fn envelope_fit_cosine_masked(
+    mz: &[f64],
+    intensity: &[f64],
+    mono_mz: f64,
+    charge: i32,
+    tol_ppm: f64,
+    min_rel: f64,
+    noise_floor: f64,
+    excluded: &[f64],
+    excl_ppm: f64,
+) -> f64 {
     if mz.is_empty() || charge == 0 {
         return 0.0;
     }
@@ -487,16 +516,24 @@ pub fn envelope_fit_cosine(
     let lo = mz.partition_point(|&m| m < win_lo);
     let hi = mz.partition_point(|&m| m <= win_hi);
 
+    // Neighbour-owned window peaks: invisible to this fit (masked from both matching and penalty).
+    let masked: Vec<bool> = (lo..hi)
+        .map(|j| !excluded.is_empty() && near_any(mz[j], excluded, excl_ppm))
+        .collect();
+
     let mut tvec: Vec<f64> = Vec::with_capacity(sig.len() + (hi - lo));
     let mut ovec: Vec<f64> = Vec::with_capacity(sig.len() + (hi - lo));
     let mut matched = vec![false; hi.saturating_sub(lo)];
 
-    // Predicted teeth: pull the nearest in-window peak within tolerance (else observed 0).
+    // Predicted teeth: pull the nearest non-masked in-window peak within tolerance (else observed 0).
     for &(k, w) in &sig {
         let target = mono_mz + k as f64 * spacing;
         let mut best_j: Option<usize> = None;
         let mut best_d = f64::INFINITY;
         for j in lo..hi {
+            if masked[j - lo] {
+                continue;
+            }
             let d = (mz[j] - target).abs();
             if d < best_d {
                 best_d = d;
@@ -513,9 +550,9 @@ pub fn envelope_fit_cosine(
         tvec.push(w);
         ovec.push(o);
     }
-    // Off-grid observed peaks in the window (above noise) → unexplained penalty (t = 0).
+    // Off-grid observed peaks in the window (above noise, not neighbour-owned) → unexplained penalty.
     for j in lo..hi {
-        if !matched[j - lo] && intensity[j] > noise_floor {
+        if !matched[j - lo] && !masked[j - lo] && intensity[j] > noise_floor {
             tvec.push(0.0);
             ovec.push(intensity[j]);
         }
@@ -552,6 +589,7 @@ pub const RECHARGE_MIN_FIT: f64 = 0.85;
 /// `prefer_charge` (the detector's own charge) is kept unless another candidate's fit exceeds it by
 /// `prefer_margin` — loyalty to the detector's charge that blocks a spurious harmonic flip (see
 /// [`RECHARGE_PREFER_MARGIN`]) while still allowing a clearly-better re-charge.
+#[allow(clippy::too_many_arguments)]
 pub fn best_charge_by_fit(
     mz: &[f64],
     intensity: &[f64],
@@ -561,6 +599,8 @@ pub fn best_charge_by_fit(
     noise_floor: f64,
     prefer_charge: i32,
     prefer_margin: f64,
+    excluded: &[f64],
+    excl_ppm: f64,
 ) -> Option<(i32, f64, f64)> {
     // (charge, monoisotopic_mass, cosine) for every candidate that yields an envelope.
     let mut evals: Vec<(i32, f64, f64)> = Vec::with_capacity(candidates.len());
@@ -572,7 +612,9 @@ pub fn best_charge_by_fit(
             continue;
         };
         let mono_mz = r.monoisotopic_mass / z.abs() as f64 + PROTON_MASS;
-        let cos = envelope_fit_cosine(mz, intensity, mono_mz, z, tol_ppm, 0.2, noise_floor);
+        let cos = envelope_fit_cosine_masked(
+            mz, intensity, mono_mz, z, tol_ppm, 0.2, noise_floor, excluded, excl_ppm,
+        );
         evals.push((z, r.monoisotopic_mass, cos));
     }
     // Best by fit (ties keep the earlier/lower candidate, since candidates are ascending).
@@ -614,6 +656,7 @@ pub fn best_charge_by_fit(
 /// A pure `argmax(template) >= 1` mode gate (~1500 Da) and a lower 2000 Da all-charge floor were both
 /// tried and regressed recall — at low charge / mid mass the fit metric's window cannot see below the
 /// mono, so it scores the +1 placement above the true one, and the walk-back over-corrects.
+#[allow(clippy::too_many_arguments)]
 pub fn walkback_mono_high_charge(
     mz: &[f64],
     intensity: &[f64],
@@ -621,6 +664,8 @@ pub fn walkback_mono_high_charge(
     charge: i32,
     tol_ppm: f64,
     noise_floor: f64,
+    excluded: &[f64],
+    excl_ppm: f64,
 ) -> f64 {
     if charge.abs() < WALKBACK_MIN_CHARGE || mono_mass < WALKBACK_MIN_MASS_DA || mz.is_empty() {
         return mono_mass;
@@ -632,7 +677,9 @@ pub fn walkback_mono_high_charge(
     for b in 0..n {
         let cand_mass = mono_mass - b as f64 * C13_MINUS_C12;
         let cand_mz = cand_mass / z + PROTON_MASS;
-        let cos = envelope_fit_cosine(mz, intensity, cand_mz, charge, tol_ppm, 0.2, noise_floor);
+        let cos = envelope_fit_cosine_masked(
+            mz, intensity, cand_mz, charge, tol_ppm, 0.2, noise_floor, excluded, excl_ppm,
+        );
         fits[b] = cos;
         if cos > best_fit {
             best_fit = cos;
@@ -753,7 +800,7 @@ mod tests {
         // (0.934) looks acceptable only because the strong 562.746 peak sits just below its window.
         let (mz, inten) = ecc_z4_apex();
         let wrong_mono = 2247.9578; // +1 too high
-        let corrected = walkback_mono_high_charge(&mz, &inten, wrong_mono, 4, 20.0, 0.0);
+        let corrected = walkback_mono_high_charge(&mz, &inten, wrong_mono, 4, 20.0, 0.0, &[], 0.0);
         assert!(
             ppm_diff(corrected, 2246.9355) <= 30.0,
             "walk-back should recover the true mono 2246.9355, got {corrected}"
@@ -766,7 +813,7 @@ mod tests {
         // leading tooth where nothing is observed and fit far worse.
         let (mz, inten) = ecc_z4_apex();
         let true_mono = 2246.9544; // what shift_decon already recovers on clean data
-        let kept = walkback_mono_high_charge(&mz, &inten, true_mono, 4, 20.0, 0.0);
+        let kept = walkback_mono_high_charge(&mz, &inten, true_mono, 4, 20.0, 0.0, &[], 0.0);
         assert!(
             (kept - true_mono).abs() < 1e-9,
             "correct mono should be left untouched, got {kept}"
@@ -779,8 +826,8 @@ mod tests {
         // its monoisotope is the mode, so an off-by-one-too-high cannot hide from the fit.
         let (mz, inten) = ecc_z4_apex();
         let m = 900.0;
-        assert_eq!(walkback_mono_high_charge(&mz, &inten, m, 4, 20.0, 0.0), m);
-        assert_eq!(walkback_mono_high_charge(&mz, &inten, m, 2, 20.0, 0.0), m);
+        assert_eq!(walkback_mono_high_charge(&mz, &inten, m, 4, 20.0, 0.0, &[], 0.0), m);
+        assert_eq!(walkback_mono_high_charge(&mz, &inten, m, 2, 20.0, 0.0, &[], 0.0), m);
     }
 
 
@@ -812,7 +859,7 @@ mod tests {
         // A clean z=2 envelope: the detector's z=2 is both the best fit and the preferred charge.
         let (mz, inten, anchor) = synthetic_envelope(1246.0, 2);
         let (z, _, _) =
-            best_charge_by_fit(&mz, &inten, anchor, &[1, 2, 4], 20.0, 0.0, 2, RECHARGE_PREFER_MARGIN)
+            best_charge_by_fit(&mz, &inten, anchor, &[1, 2, 4], 20.0, 0.0, 2, RECHARGE_PREFER_MARGIN, &[], 0.0)
                 .expect("charge");
         assert_eq!(z, 2, "clean z=2 envelope should stay z=2");
     }
@@ -824,7 +871,7 @@ mod tests {
         // is the light-z2 charge-halving recovery that must survive the loyalty margin + floor.
         let (mz, inten, anchor) = synthetic_envelope(1246.0, 2);
         let (z, _, cos) =
-            best_charge_by_fit(&mz, &inten, anchor, &[1, 2], 20.0, 0.0, 1, RECHARGE_PREFER_MARGIN)
+            best_charge_by_fit(&mz, &inten, anchor, &[1, 2], 20.0, 0.0, 1, RECHARGE_PREFER_MARGIN, &[], 0.0)
                 .expect("charge");
         assert_eq!(z, 2, "a clean z=2 fit must override a wrong z=1 detector label");
         assert!(cos >= RECHARGE_MIN_FIT, "the winning z=2 fit {cos} should clear the floor");
