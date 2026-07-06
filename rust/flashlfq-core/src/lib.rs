@@ -15,6 +15,7 @@ pub mod engine;
 pub mod feature_refinement;
 pub mod isotope_shift_decon;
 pub mod isotopic_distribution;
+pub mod joint_fit;
 pub mod isotopic_envelope;
 pub mod mbr;
 pub mod mbr_chromatographic_peak;

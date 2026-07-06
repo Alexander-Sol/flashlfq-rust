@@ -44,9 +44,26 @@ Assessment: **modest but real.** The neighbour-masking mostly overlaps failure m
   - lock ≥0.9: 601/582 · lock ≥0.95: 601/583. Asymptotes to baseline as the gate tightens; **never beats baseline 602/584, and below the intensity-dominance mask (603/585).**
   - **Lesson:** for masking, "who owns this shared peak" is answered by **intensity dominance**, not refinement confidence/order. A confident-but-weak neighbour doesn't own a peak the current feature might legitimately share. Intensity-ratio single-pass (≥5×) remains the masking winner.
 
-## Strategy 2 (user-requested): joint linear model for residual low-score features
-Instead of masking, for features still scoring poorly after refinement: fit two+ overlapping envelopes SIMULTANEOUSLY — adjust position (mono shift) + intensity (amplitude via non-negative least squares) to maximise the combined fit. This is the "match multiple envelopes simultaneously" advanced decon from the original request. In progress.
+## Strategy 2 (user-requested): joint linear model — `src/joint_fit.rs` + `JOINT_FIT`
+New module: `nnls` (Lawson–Hanson active-set NNLS), `joint_envelope_fit` (models a window as a
+non-negative sum of averagine envelopes over the union grid, returns amplitudes + cosine),
+`joint_fit_target_shift` (searches the target mono over ¹³C shifts with neighbours fixed). 4 unit tests
+pass (recovers amplitudes of overlapping envelopes 3 Da apart; shift search recovers a mis-seeded mono).
+Wired as a post-refine pass (`apply_joint_fit_pass`): for each refined feature scoring < `JOINT_FIT_MAX_SCORE`,
+model its window as itself + up to 3 overlapping co-eluting neighbours, shift-search the target, accept a
+move only if the target's solo re-score improves by `JOINT_FIT_MIN_GAIN`.
+
+Results (CA/Lumos cov90):
+- max_score 0.7, min_gain 0.02: moved 5473, **602/584 — net zero, 0 reference peptides changed.**
+- max_score 0.9, min_gain 0.02: moved 5726, 602/584 — **+1 gained (AVVQDPALKPLALVYGEATSRR z4, heavy/chimeric) / −1 lost (YENEVALR z2, over-corrected).**
+- max_score 0.9, min_gain 0.2: moved 1234, 602/584 — **0/0** (strict gate rejects both the gain and the loss; they're in the same marginal-improvement regime, so min_gain can't separate them).
+
+**Conclusion: net-zero on recall.** The primitive is correct and genuinely separates overlapping envelopes, but (a) the low-score features it moves are overwhelmingly non-reference (junk), and (b) the residual reference misses (e.g. YAA) are NOT fixable by a mono-shift — at their apex the true-mono placement's own fit is inherently poor (contaminated envelope), so no target-fit-driven method prefers it. The joint model separates signal; it cannot manufacture fit where the evidence is weak. **Kept as a validated primitive** (the foundation for advanced multi-envelope decon / overlapping-feature quantification), opt-in, default unchanged.
+
+## Overall assessment of neighbour-aware refinement (this session)
+Neighbour information gives at best a **marginal** recall improvement on this dataset (the intensity-dominance mask, +1/+1 → 603/585), because the shipped fixes (co-elution knitting, RECHARGE_MIN_FIT, fit tiebreak, walk-back) already capture most neighbour-driven failures. The remaining ~18 misses are dominated by cases neighbour-awareness can't reach: inherently poor target evidence (contaminated apex), detection-depth, or FlashLFQ being wrong on heavy modforms. The joint-fit primitive is the most reusable artifact (advanced decon foundation).
 
 ## Approaches NOT yet tried
 - **Down-weight vs hard-mask** shared peaks (competitive split) — softer than the invisible mask.
-- **Off-by-one via neighbour coherence** for the sub-walk-back-gate class (YAA).
+- **Joint fit at the QUANTIFICATION stage** (split shared-peak intensity between overlapping features) rather than as a mono-corrector — likely the joint model's real value.
+- **Off-by-one via neighbour coherence** for the sub-walk-back-gate class (YAA), accepting that some need a second (non-apex) scan where the true mono is cleaner.

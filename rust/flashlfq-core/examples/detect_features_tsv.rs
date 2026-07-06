@@ -21,8 +21,10 @@ use flashlfq_core::feature_refinement::{
     resolve_charge_state_consensus, DeconView, FourWayDecon, NeighborIndex, RefinedFeature,
     ResolvedFeature,
 };
+use flashlfq_core::isotope_shift_decon::envelope_fit_cosine;
 use flashlfq_core::isotopic_envelope::{mass_to_mz_f64, C13_MINUS_C12};
-use flashlfq_core::peak_indexing::{read_ms1_scans, PeakIndexingEngine, PeakKey};
+use flashlfq_core::joint_fit::{joint_fit_target_shift, Component};
+use flashlfq_core::peak_indexing::{read_ms1_scans, PeakIndexingEngine, PeakKey, Scan};
 use flashlfq_core::trace_kernel::{
     detect_features, estimate_noise_floor, median_ms1_scan_spacing_minutes, CombWeightModel,
     DetectedFeature, ScoreModel, TraceKernelParameters, FWHM_TO_SIGMA,
@@ -113,6 +115,115 @@ fn filter_off_own_grid(raw: Vec<f64>, f: &DetectedFeature) -> Vec<f64> {
             })
         })
         .collect()
+}
+
+/// Post-refine **joint linear-model** pass (`JOINT_FIT`): for each refined feature still scoring below
+/// `max_score`, model its window as its own averagine envelope PLUS the overlapping co-eluting
+/// neighbours and search the target's monoisotope over ¹³C shifts to maximise the joint (NNLS) fit —
+/// correcting a residual mis-placement the single-envelope refine could not resolve because a
+/// neighbour's peaks were confusing the score. Mutates `refined` in place; returns how many were moved.
+fn apply_joint_fit_pass(
+    refined: &mut [RefinedFeature],
+    scans: &[Scan],
+    max_score: f64,
+    min_gain: f64,
+) -> usize {
+    let rt_tol = 0.05;
+    let bin_of = |rt: f64| -> i64 { (rt / rt_tol).floor() as i64 };
+    // Per-feature: (mono_mz, spacing, charge, apex_rt, intensity, kmax).
+    let info: Vec<(f64, f64, i32, f64, f64, i32)> = refined
+        .iter()
+        .map(|r| {
+            let z = r.refined_charge;
+            let mono_mz = mass_to_mz_f64(r.refined_monoisotopic_mass, z);
+            let spacing = C13_MINUS_C12 / z.max(1) as f64;
+            (
+                mono_mz,
+                spacing,
+                z,
+                r.detected.apex_rt,
+                r.detected.summed_intensity,
+                r.detected.num_isotopes_observed as i32 + 2,
+            )
+        })
+        .collect();
+    let mut buckets: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (i, inf) in info.iter().enumerate() {
+        buckets.entry(bin_of(inf.3)).or_default().push(i);
+    }
+
+    // Collect updates first (immutable borrow of refined via info), then apply.
+    let mut updates: Vec<(usize, f64, f64)> = Vec::new(); // (idx, new_mono_mass, new_score)
+    for i in 0..refined.len() {
+        if refined[i].decon_score >= max_score {
+            continue;
+        }
+        let (mono_mz, spacing, z, rt, _int, kmax) = info[i];
+        let win_lo = mono_mz - 0.6 * spacing;
+        let win_hi = mono_mz + (kmax as f64 + 1.0) * spacing;
+        // Overlapping co-eluting neighbours (any tooth in the window), strongest first, up to 3.
+        let b = bin_of(rt);
+        let mut neigh: Vec<usize> = Vec::new();
+        for bb in (b - 1)..=(b + 1) {
+            let Some(v) = buckets.get(&bb) else { continue };
+            for &j in v {
+                if j == i || (info[j].3 - rt).abs() > rt_tol {
+                    continue;
+                }
+                let (jm, js, _jz, _, _jint, jk) = info[j];
+                let overlaps = (0..=jk).any(|k| {
+                    let m = jm + k as f64 * js;
+                    m >= win_lo && m <= win_hi
+                });
+                if overlaps {
+                    neigh.push(j);
+                }
+            }
+        }
+        if neigh.is_empty() {
+            continue;
+        }
+        neigh.sort_by(|&a, &c| info[c].4.total_cmp(&info[a].4));
+        neigh.truncate(3);
+
+        let ai = refined[i].detected.apex_scan_index.max(0) as usize;
+        if ai >= scans.len() {
+            continue;
+        }
+        let s = &scans[ai];
+        let lo = s.mz.partition_point(|&m| m < win_lo - 0.1);
+        let hi = s.mz.partition_point(|&m| m <= win_hi + 0.1);
+        if hi <= lo + 1 {
+            continue;
+        }
+        let (mzw, inw) = (&s.mz[lo..hi], &s.intensity[lo..hi]);
+
+        let mut comps = vec![Component { mono_mz, charge: z }];
+        for &j in &neigh {
+            comps.push(Component { mono_mz: info[j].0, charge: info[j].2 });
+        }
+        let (shift, _jr) =
+            joint_fit_target_shift(mzw, inw, &comps, &[-2, -1, 0, 1, 2], 20.0, 0.2, 0.0);
+        if shift != 0 {
+            let new_mass = refined[i].refined_monoisotopic_mass + shift as f64 * C13_MINUS_C12;
+            let new_mono_mz = mass_to_mz_f64(new_mass, z);
+            // Re-score the target alone at the corrected placement (single-envelope, for consensus).
+            let new_score = envelope_fit_cosine(mzw, inw, new_mono_mz, z, 20.0, 0.2, 0.0);
+            // Only accept a move that improves the target's own fit by a clear margin (guards against
+            // over-correcting a feature onto a neighbour's peak for a marginal gain).
+            if new_score > refined[i].decon_score + min_gain {
+                updates.push((i, new_mass, new_score));
+            }
+        }
+    }
+
+    let n = updates.len();
+    for (i, mass, score) in updates {
+        refined[i].refined_monoisotopic_mass = mass;
+        refined[i].candidate_masses = vec![mass];
+        refined[i].decon_score = score;
+    }
+    n
 }
 
 /// Derives a sibling output path from the final path: `out.tsv` + tag `detected` -> `out.detected.tsv`.
@@ -487,6 +598,26 @@ fn main() {
         detected.len(),
         refine_dur
     );
+
+    // JOINT_FIT: post-refine joint linear-model pass over low-scoring features (see apply_joint_fit_pass).
+    if use_shift && std::env::var("JOINT_FIT").is_ok() {
+        let max_score = std::env::var("JOINT_FIT_MAX_SCORE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.7);
+        let min_gain = std::env::var("JOINT_FIT_MIN_GAIN")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.02);
+        let tj = Instant::now();
+        let moved = apply_joint_fit_pass(&mut refined, &scans, max_score, min_gain);
+        timings.push(("joint fit".into(), tj.elapsed().as_secs_f64()));
+        eprintln!(
+            "  JOINT_FIT: joint linear-model pass moved {moved} low-scoring features (< {max_score})  ({:.1?})",
+            tj.elapsed()
+        );
+    }
+
     write_refined_tsv(&refined_path, &refined);
     eprintln!("  wrote {} refined features -> {refined_path}", refined.len());
 
