@@ -38,6 +38,7 @@
 use crate::deconvolution::{classic_deconvolute, ClassicDeconvolutionParameters};
 use crate::isotope_shift_decon::{
     best_charge_by_fit, envelope_fit_cosine, shift_decon, shift_decon_gated, shift_decon_in_window,
+    walkback_mono_high_charge,
 };
 use crate::isotopic_envelope::{mass_to_mz_f64, C13_MINUS_C12};
 use crate::peak_indexing::{PeakKey, Scan};
@@ -58,6 +59,12 @@ pub const MAX_SCANS_TO_AVERAGE: usize = 3;
 /// Largest integer ¹³C off-by-one offset tolerated when grouping features by neutral mass. The mono
 /// off-by-one is normally ±1; ±2 is allowed for robustness against a doubly-mis-assigned monoisotope.
 const MAX_OFFBYONE_UNITS: i32 = 2;
+
+/// RT padding (minutes) added to each side of a feature's elution window when testing tight co-elution
+/// for an off-by-one link ([`features_coelute_tightly`]). ~0.6 s — about half an MS1 cycle on this
+/// data — so a feature detected in only one or two scans can still match a genuinely co-eluting partner
+/// whose apex sits a scan away, without admitting a species several scans distant.
+const COELUTION_PAD_MIN: f64 = 0.01;
 
 /// A detected feature refined against an averaged composite spectrum via the parity-gated classic
 /// deconvolution. Carries the raw candidate-mass list the charge-state consensus intersects.
@@ -146,7 +153,7 @@ pub fn refine_feature_shift(
         (&s.comp_mz, &s.comp_int)
     };
 
-    let (refined_charge, refined_mono) = if recharge {
+    let (refined_charge, refined_mono0) = if recharge {
         let candidates = charge_candidates(feature.charge);
         let (z, mono, _cos) =
             best_charge_by_fit(mz, inten, anchor_mz, &candidates, shift_tol_ppm, 0.0)?;
@@ -155,6 +162,11 @@ pub fn refine_feature_shift(
         let r = shift_decon(mz, inten, anchor_mz, feature.charge, shift_tol_ppm)?;
         (feature.charge, r.monoisotopic_mass)
     };
+    // High-charge double-check: heavy peptides can seed the mono one or two ¹³C too high (the envelope
+    // mode sits well above the mono), and the fit window never sees the unexplained peak beneath it.
+    // Walk the mono back up to 2 ¹³C and keep the lowest that still fits (no-op for |z| < 4 / good mono).
+    let refined_mono =
+        walkback_mono_high_charge(mz, inten, refined_mono0, refined_charge, shift_tol_ppm, 0.0);
     Some(RefinedFeature {
         detected: feature.clone(),
         refined_monoisotopic_mass: refined_mono,
@@ -1053,10 +1065,32 @@ fn features_link(
     for k in -MAX_OFFBYONE_UNITS..=MAX_OFFBYONE_UNITS {
         let shifted = mb + k as f64 * C13_MINUS_C12;
         if ppm_diff(ma, shifted) <= mass_tolerance_ppm {
-            return true;
+            // k == 0 is a plain same-mass cross-charge match (the same peptide seen at another charge);
+            // apex proximity is enough. k != 0 is an *off-by-one* bridge — two features whose masses
+            // differ by 1–2 ¹³C. That is a real mono-placement disagreement only when they are the
+            // same peptide, which co-elutes tightly; a different species sitting ~1 Da away that merely
+            // drifts inside the loose apex window would otherwise be knitted as a spurious off-by-one
+            // (and could then out-vote the true placement in consensus). So gate k != 0 on tight
+            // co-elution: each apex must fall inside the other's elution bounds.
+            if k == 0 || features_coelute_tightly(a, b) {
+                return true;
+            }
         }
     }
     false
+}
+
+/// Whether `a` and `b` share a chromatographic peak closely enough to be one peptide's off-by-one /
+/// cross-charge pair, rather than two different species ~1 Da apart that merely pass the loose apex-RT
+/// window. Requires **each** feature's apex to fall within the other's `[start_rt, end_rt]` elution
+/// bounds (padded by [`COELUTION_PAD_MIN`] so a narrow, few-scan feature can still match a co-eluting
+/// partner). Charge states of the same peptide share an apex and pass; a species eluting several scans
+/// away has its apex outside the other's peak and fails.
+fn features_coelute_tightly(a: &RefinedFeature, b: &RefinedFeature) -> bool {
+    let a = &a.detected;
+    let b = &b.detected;
+    let within = |apex: f64, s: f64, e: f64| apex >= s - COELUTION_PAD_MIN && apex <= e + COELUTION_PAD_MIN;
+    within(a.apex_rt, b.start_rt, b.end_rt) && within(b.apex_rt, a.start_rt, a.end_rt)
 }
 
 /// Resolves one group of grouped-and-cloned members into a [`ResolvedFeature`].
@@ -1118,6 +1152,10 @@ struct Candidate {
 /// and returns the (weighted-mean mass, cross-charge support) of the cluster with the greatest
 /// cross-charge support (ties: candidate count, then summed weight). Returns the tallest member's
 /// refined mass if there are no candidates to cluster.
+///
+/// (A fit-weighted variant — ranking clusters by summed per-charge `decon_score` instead of raw
+/// distinct-charge count, to stop off-by-one siblings out-voting a single correct placement — was
+/// tried and regressed CA/Lumos recall, so support stays a plain distinct-charge count.)
 fn resolve_mass_by_cross_charge(
     members: &[RefinedFeature],
     mass_tolerance_ppm: f64,
@@ -1368,6 +1406,43 @@ mod tests {
             true_mass,
             ppm_of(r.monoisotopic_mass, true_mass)
         );
+    }
+
+    #[test]
+    fn offbyone_across_separate_elution_peaks_are_not_knitted() {
+        // ECCHGDLLECADDRADLAK scenario: a real z=4 feature at the true mass, and a DIFFERENT species
+        // exactly +1 ¹³C away (a co-eluting z=3 peptide that only *looks* like an off-by-one). Their
+        // apexes are 0.099 min apart — inside the 0.1 min apex window — but the interloper's apex sits
+        // OUTSIDE the true feature's narrow elution bounds, so they must stay two distinct features. If
+        // knitted, the stronger interloper's +1 mass would win consensus and the true mono would be
+        // lost (the observed off-by-one miss).
+        let true_mass = 2246.9533;
+        let interloper = true_mass + C13_MINUS_C12;
+        let mut a = make_refined(4, true_mass, vec![true_mass], 12.153, 9.0e6);
+        a.detected.start_rt = 12.153;
+        a.detected.end_rt = 12.169; // narrow, weak, few-scan peak
+        let mut b = make_refined(3, interloper, vec![interloper], 12.252, 2.0e8);
+        b.detected.start_rt = 12.136;
+        b.detected.end_rt = 12.252; // broad, strong, apex outside a's window
+        let resolved = resolve_charge_state_consensus(&[a, b], 10.0, 0.1);
+        assert_eq!(
+            resolved.len(),
+            2,
+            "separately-eluting off-by-one species must not be knitted (got {} group(s))",
+            resolved.len()
+        );
+    }
+
+    #[test]
+    fn coeluting_offbyone_charges_still_knit() {
+        // Counterpart: a genuine same-peptide off-by-one across charges, sharing an apex, MUST still
+        // knit (the co-elution gate only blocks the separately-eluting case above).
+        let true_mass = 1500.0;
+        let off = true_mass + C13_MINUS_C12;
+        let a = make_refined(2, true_mass, vec![true_mass], 20.0, 5.0e6); // window [19.8, 20.2]
+        let b = make_refined(3, off, vec![off, true_mass], 20.03, 3.0e6); // window [19.83, 20.23]
+        let resolved = resolve_charge_state_consensus(&[a, b], 15.0, 0.1);
+        assert_eq!(resolved.len(), 1, "co-eluting off-by-one charges should knit into one feature");
     }
 
     #[test]

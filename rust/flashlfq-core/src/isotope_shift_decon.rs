@@ -74,6 +74,26 @@ pub const WIDE_SHIFTS: [i32; 5] = [-2, -1, 0, 1, 2];
 /// peptides whose off-by-one can span two isotopes.
 pub const WIDE_SHIFT_MIN_CHARGE: i32 = 4;
 
+/// Number of ¹³C units to walk the monoisotope back when double-checking a high-charge placement
+/// (see [`walkback_mono_high_charge`]). Two covers the common heavy-peptide off-by-{one,two}-too-high.
+pub const WALKBACK_MAX_C13: i32 = 2;
+
+/// A lower-mass monoisotope hypothesis is adopted during the walk-back check if its envelope fit is
+/// within this margin of the best-fitting candidate. Small and positive: the walk-back should only
+/// prefer the lower mono when it explains the data *at least as well*, not merely differently.
+pub const WALKBACK_FIT_MARGIN: f64 = 0.01;
+
+/// Monoisotopic-mass floor (Da) for the walk-back check. Mass is the physical driver of the
+/// off-by-one-too-high error — only heavy peptides carry an envelope mode well above the mono — so the
+/// gate keys on mass, with [`WALKBACK_MIN_CHARGE`] as a companion floor.
+pub const WALKBACK_MIN_MASS_DA: f64 = 2200.0;
+
+/// Minimum `|charge|` for the walk-back check, paired with [`WALKBACK_MIN_MASS_DA`]. A heavy peptide's
+/// low-charge (z=1/z=2) observations are sparse and their envelopes are best-resolved at z>=3; walking
+/// those back added no recall and risked the metric's below-mono blind spot.
+pub const WALKBACK_MIN_CHARGE: i32 = 3;
+
+
 /// The shift hypotheses to search for a given charge: [`WIDE_SHIFTS`] once `|charge|` reaches
 /// [`WIDE_SHIFT_MIN_CHARGE`], else [`BASE_SHIFTS`].
 pub fn shifts_for_charge(charge: i32) -> &'static [i32] {
@@ -425,6 +445,10 @@ pub fn isotope_completeness(
 /// The window is `[mono_mz − 0.5·spacing, mono_mz + (kmax+1)·spacing]` where `kmax` is the last
 /// significant tooth (weight ≥ `min_rel` of the mode); observed peaks below `noise_floor` are ignored
 /// (not counted as "unexplained"). Returns a value in `[0, 1]` (`0` on degenerate input).
+///
+/// A wider lower reach (2.5·spacing, to see the peak below a too-high monoisotope) was tried both
+/// globally and scoped to the walk-back and regressed CA/Lumos recall in every form, so the window
+/// stays tight.
 pub fn envelope_fit_cosine(
     mz: &[f64],
     intensity: &[f64],
@@ -535,6 +559,60 @@ pub fn best_charge_by_fit(
     best
 }
 
+/// Double-check a **heavy-peptide** monoisotope by walking it back up to [`WALKBACK_MAX_C13`] ¹³C units.
+///
+/// The default [`envelope_fit_cosine`] window begins at `mono − 0.5·spacing`, so a strong peak one or
+/// two isotopes **below** the chosen mono is invisible to the fit. That is exactly the signature of an
+/// off-by-one(-or-two)-**too-high** placement, which is common for heavy peptides: their envelope mode
+/// sits above the monoisotope, so the detector (and even the shift search, if its anchor/slice differ
+/// from the ideal) can seed the mono on a peak one or two ¹³C too high and the fit will not notice the
+/// unexplained signal beneath it.
+///
+/// This re-scores the mono against its 1- and 2-¹³C-lower alternatives — whose windows **do** include
+/// those lower teeth — and adopts the **lowest-mass** hypothesis whose fit is within
+/// [`WALKBACK_FIT_MARGIN`] of the best. It is self-protecting: a correctly-placed mono's lower
+/// alternatives predict a leading tooth where nothing is observed and score far worse, so a good mono
+/// is never walked back.
+///
+/// Gated on **mass** ([`WALKBACK_MIN_MASS_DA`]) with a companion charge floor ([`WALKBACK_MIN_CHARGE`]):
+/// mass is what drives the error (only heavy peptides carry an envelope mode well above the mono).
+/// A pure `argmax(template) >= 1` mode gate (~1500 Da) and a lower 2000 Da all-charge floor were both
+/// tried and regressed recall — at low charge / mid mass the fit metric's window cannot see below the
+/// mono, so it scores the +1 placement above the true one, and the walk-back over-corrects.
+pub fn walkback_mono_high_charge(
+    mz: &[f64],
+    intensity: &[f64],
+    mono_mass: f64,
+    charge: i32,
+    tol_ppm: f64,
+    noise_floor: f64,
+) -> f64 {
+    if charge.abs() < WALKBACK_MIN_CHARGE || mono_mass < WALKBACK_MIN_MASS_DA || mz.is_empty() {
+        return mono_mass;
+    }
+    let z = charge.abs() as f64;
+    let n = (WALKBACK_MAX_C13 + 1) as usize;
+    let mut fits = vec![f64::NEG_INFINITY; n];
+    let mut best_fit = f64::NEG_INFINITY;
+    for b in 0..n {
+        let cand_mass = mono_mass - b as f64 * C13_MINUS_C12;
+        let cand_mz = cand_mass / z + PROTON_MASS;
+        let cos = envelope_fit_cosine(mz, intensity, cand_mz, charge, tol_ppm, 0.2, noise_floor);
+        fits[b] = cos;
+        if cos > best_fit {
+            best_fit = cos;
+        }
+    }
+    // Prefer the lowest-mass (largest walk-back) candidate that still fits within the margin of the
+    // best — the off-by-one error is directionally "mono too high", never too low.
+    for b in (0..n).rev() {
+        if fits[b] >= best_fit - WALKBACK_FIT_MARGIN {
+            return mono_mass - b as f64 * C13_MINUS_C12;
+        }
+    }
+    mono_mass
+}
+
 /// Whether `mz` is within `ppm` of any position in the ascending `sorted` list.
 fn near_any(mz: f64, sorted: &[f64], ppm: f64) -> bool {
     if sorted.is_empty() {
@@ -617,6 +695,59 @@ mod tests {
     fn ppm_diff(a: f64, b: f64) -> f64 {
         (a - b).abs() / b * 1e6
     }
+
+    /// Real apex peaks for `23_ECCHGDLLECADDRADLAK_z4` (true mono 2246.9355, z=4). The detector
+    /// seeded this feature's mono on the **+2** isotope (563.247, mass 2248.96), one of the
+    /// heavy-peptide off-by-two-too-high cases. Used by the walk-back regression tests below.
+    fn ecc_z4_apex() -> (Vec<f64>, Vec<f64>) {
+        let apex: &[(f64, f64)] = &[
+            (562.24908, 2.723067e5), (562.35175, 1.424823e6), (562.50031, 3.830424e5),
+            (562.74670, 7.995974e6), (562.76428, 2.456608e5), (562.97852, 2.544323e5),
+            (562.99744, 8.917290e6), (563.24756, 5.830500e6), (563.28729, 2.374914e5),
+            (563.29932, 2.094416e5), (563.36053, 9.135656e5), (563.49811, 3.341500e6),
+            (563.74756, 1.148486e6), (563.76013, 2.952547e5), (563.99792, 6.053904e5),
+            (564.10522, 3.223775e5), (564.24969, 2.600071e5), (564.28308, 2.871794e5),
+            (564.36462, 2.759059e5), (564.50531, 2.771088e5),
+        ];
+        (apex.iter().map(|p| p.0).collect(), apex.iter().map(|p| p.1).collect())
+    }
+
+    #[test]
+    fn walkback_recovers_true_mono_for_off_by_one_high_charge() {
+        // Simulate refine having landed on the +1 mono (562.997 → mass 2247.9578). The fit there
+        // (0.934) looks acceptable only because the strong 562.746 peak sits just below its window.
+        let (mz, inten) = ecc_z4_apex();
+        let wrong_mono = 2247.9578; // +1 too high
+        let corrected = walkback_mono_high_charge(&mz, &inten, wrong_mono, 4, 20.0, 0.0);
+        assert!(
+            ppm_diff(corrected, 2246.9355) <= 30.0,
+            "walk-back should recover the true mono 2246.9355, got {corrected}"
+        );
+    }
+
+    #[test]
+    fn walkback_leaves_correct_mono_untouched() {
+        // A correctly-placed mono must not be walked back: its 1-/2-lower alternatives predict a
+        // leading tooth where nothing is observed and fit far worse.
+        let (mz, inten) = ecc_z4_apex();
+        let true_mono = 2246.9544; // what shift_decon already recovers on clean data
+        let kept = walkback_mono_high_charge(&mz, &inten, true_mono, 4, 20.0, 0.0);
+        assert!(
+            (kept - true_mono).abs() < 1e-9,
+            "correct mono should be left untouched, got {kept}"
+        );
+    }
+
+    #[test]
+    fn walkback_noop_below_mass_floor() {
+        // Mass gate: a light peptide (~900 Da, below WALKBACK_MIN_MASS_DA) is a no-op at any charge —
+        // its monoisotope is the mode, so an off-by-one-too-high cannot hide from the fit.
+        let (mz, inten) = ecc_z4_apex();
+        let m = 900.0;
+        assert_eq!(walkback_mono_high_charge(&mz, &inten, m, 4, 20.0, 0.0), m);
+        assert_eq!(walkback_mono_high_charge(&mz, &inten, m, 2, 20.0, 0.0), m);
+    }
+
 
     /// Builds a clean synthetic spectrum from the averagine template for a peptide of monoisotopic
     /// `mono_mass` at `charge`: one peak per template tooth, placed at the tooth's m/z with the
