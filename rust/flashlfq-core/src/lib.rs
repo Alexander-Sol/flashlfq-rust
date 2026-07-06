@@ -13,6 +13,7 @@ pub mod deconvolution;
 pub mod detection_type;
 pub mod engine;
 pub mod feature_refinement;
+pub mod isotope_shift_decon;
 pub mod isotopic_distribution;
 pub mod isotopic_envelope;
 pub mod mbr;

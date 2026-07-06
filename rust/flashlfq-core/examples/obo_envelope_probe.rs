@@ -26,6 +26,7 @@ use flashlfq_core::deconvolution::{
     averagine_intensities_from_mono, classic_deconvolute, ClassicDeconvolutionParameters,
     DeconEnvelope, Polarity,
 };
+use flashlfq_core::isotope_shift_decon::shift_decon_in_window;
 use flashlfq_core::isotopic_envelope::{C13_MINUS_C12, PROTON_MASS};
 use flashlfq_core::peak_indexing::{read_ms1_scans, PeakIndexingEngine};
 use flashlfq_core::spectral_averaging::{average_spectra, SpectralAveragingParameters};
@@ -167,6 +168,43 @@ fn decon_and_report(
     }
 }
 
+/// Run the untargeted FlashLFQ-style shift decon on a local (mz, intensity) slice and report where
+/// it places the monoisotope (¹³C offset k vs the reference), the winning shift, per-shift
+/// correlations, and the shift-0 acceptance gate. `range_min`/`range_max` bound the anchor search to
+/// the peptide envelope so the tallest-peak anchor is the envelope mode, not a distant interferent.
+fn shift_report(
+    mz: &[f64],
+    inten: &[f64],
+    t: &Target,
+    range_min: f64,
+    range_max: f64,
+    indent: &str,
+) {
+    match shift_decon_in_window(mz, inten, range_min, range_max, t.z, 20.0) {
+        None => println!("{indent}shift-decon: (no anchor peak in window)"),
+        Some(r) => {
+            let k = ((r.monoisotopic_mass - t.ref_mono) / C13_MINUS_C12).round() as i32;
+            let corrected = t.ref_mono + k as f64 * C13_MINUS_C12;
+            let ppm = (r.monoisotopic_mass - corrected) / corrected * 1e6;
+            let verdict = if k == 0 { "CORRECT" } else { "OFF-BY-ONE" };
+            println!(
+                "{indent}shift-decon: mono {:.4} [k={:+}, {:+.1} ppm] {verdict}  \
+                 best_shift={:+}  mode={}  corr[-1/0/+1]={:.3}/{:.3}/{:.3}  gate={}  matched={}",
+                r.monoisotopic_mass,
+                k,
+                ppm,
+                r.best_shift,
+                r.mode_index,
+                r.shift_correlations[0],
+                r.shift_correlations[1],
+                r.shift_correlations[2],
+                if r.shift0_passes_gate { "PASS" } else { "fail" },
+                r.matched_isotopes,
+            );
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let spectra_path = args
@@ -299,6 +337,16 @@ fn main() {
             .join("  ");
         println!("  composite: {cpeaks}");
         decon_and_report(&cmz, &cint, t, &decon, range_min, range_max, "      ");
+        shift_report(&cmz, &cint, t, range_min, range_max, "      ");
+
+        // --- FlashLFQ-style shift decon on the apex scan too (the second of the four decon views) ---
+        {
+            let apex = &scans[apex_idx as usize];
+            let a = apex.mz.partition_point(|&m| m < slice_lo);
+            let b = apex.mz.partition_point(|&m| m <= slice_hi);
+            println!("  --- apex scan {} shift decon ---", apex.one_based_scan_number);
+            shift_report(&apex.mz[a..b], &apex.intensity[a..b], t, range_min, range_max, "      ");
+        }
         println!();
 
         // --- data export for plotting ---
