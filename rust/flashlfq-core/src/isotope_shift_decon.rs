@@ -530,10 +530,28 @@ pub fn envelope_fit_cosine(
     dot / (nt * no)
 }
 
+/// Envelope-fit margin by which an alternative charge must beat the detector's own charge before
+/// [`best_charge_by_fit`] overrides it. A charge harmonic (z ↔ 2z) can spuriously tie or slightly beat
+/// the true charge in a crowded window — the lower charge's teeth are a subset of the higher charge's
+/// grid, and interferents fill the intervening higher-charge teeth — so re-charging is gated on a
+/// clear improvement. Calibrated so a genuine re-charge still passes (e.g. a real z=2 the detector
+/// called z=1 fits far better at z=2) while a spurious z→2z doubling in dense signal does not.
+pub const RECHARGE_PREFER_MARGIN: f64 = 0.05;
+
+/// Minimum absolute envelope fit an alternative charge must reach to override the detector's own
+/// charge in [`best_charge_by_fit`]. Blocks a spurious harmonic flip whose "better" fit is only a
+/// mediocre cosine earned by absorbing interferents on a denser grid; a genuine re-charge clears this
+/// comfortably. See [`RECHARGE_PREFER_MARGIN`].
+pub const RECHARGE_MIN_FIT: f64 = 0.85;
+
 /// Chooses the charge from `candidates` whose shift-placed envelope best fits the slice by
 /// [`envelope_fit_cosine`]. Each candidate charge is placed with [`shift_decon`] anchored on
 /// `anchor_mz`, then scored. Returns `(charge, monoisotopic_mass, cosine)` of the best, or `None` if
 /// no candidate yields an envelope.
+///
+/// `prefer_charge` (the detector's own charge) is kept unless another candidate's fit exceeds it by
+/// `prefer_margin` — loyalty to the detector's charge that blocks a spurious harmonic flip (see
+/// [`RECHARGE_PREFER_MARGIN`]) while still allowing a clearly-better re-charge.
 pub fn best_charge_by_fit(
     mz: &[f64],
     intensity: &[f64],
@@ -541,8 +559,11 @@ pub fn best_charge_by_fit(
     candidates: &[i32],
     tol_ppm: f64,
     noise_floor: f64,
+    prefer_charge: i32,
+    prefer_margin: f64,
 ) -> Option<(i32, f64, f64)> {
-    let mut best: Option<(i32, f64, f64)> = None;
+    // (charge, monoisotopic_mass, cosine) for every candidate that yields an envelope.
+    let mut evals: Vec<(i32, f64, f64)> = Vec::with_capacity(candidates.len());
     for &z in candidates {
         if z == 0 {
             continue;
@@ -552,11 +573,25 @@ pub fn best_charge_by_fit(
         };
         let mono_mz = r.monoisotopic_mass / z.abs() as f64 + PROTON_MASS;
         let cos = envelope_fit_cosine(mz, intensity, mono_mz, z, tol_ppm, 0.2, noise_floor);
-        if best.map_or(true, |(_, _, bc)| cos > bc) {
-            best = Some((z, r.monoisotopic_mass, cos));
+        evals.push((z, r.monoisotopic_mass, cos));
+    }
+    // Best by fit (ties keep the earlier/lower candidate, since candidates are ascending).
+    let best = evals
+        .iter()
+        .copied()
+        .reduce(|a, b| if b.2 > a.2 { b } else { a })?;
+    // Detector-charge loyalty: keep prefer_charge unless another candidate BOTH beats it by the
+    // margin AND itself fits well in absolute terms. The absolute floor is what blocks a spurious
+    // harmonic (z↔2z) win in a crowded window: there the higher charge only "fits better" by
+    // absorbing interferents on its denser grid, reaching a mediocre cosine (~0.69 on HVGDLGNVTADK's
+    // sodium adduct), whereas a genuine re-charge fits cleanly (~0.98 on the light z=2 class). Without
+    // the floor, a large but low-quality margin flips the correct charge.
+    if let Some(pref) = evals.iter().copied().find(|e| e.0 == prefer_charge) {
+        if best.2 <= pref.2 + prefer_margin || best.2 < RECHARGE_MIN_FIT {
+            return Some(pref);
         }
     }
-    best
+    Some(best)
 }
 
 /// Double-check a **heavy-peptide** monoisotope by walking it back up to [`WALKBACK_MAX_C13`] ¹³C units.
@@ -770,6 +805,29 @@ mod tests {
         let mode = argmax(&inten);
         let anchor_mz = mz[mode];
         (mz, inten, anchor_mz)
+    }
+
+    #[test]
+    fn best_charge_keeps_detector_charge_on_clean_envelope() {
+        // A clean z=2 envelope: the detector's z=2 is both the best fit and the preferred charge.
+        let (mz, inten, anchor) = synthetic_envelope(1246.0, 2);
+        let (z, _, _) =
+            best_charge_by_fit(&mz, &inten, anchor, &[1, 2, 4], 20.0, 0.0, 2, RECHARGE_PREFER_MARGIN)
+                .expect("charge");
+        assert_eq!(z, 2, "clean z=2 envelope should stay z=2");
+    }
+
+    #[test]
+    fn best_charge_allows_genuine_recharge_to_cleanly_fitting_alt() {
+        // Detector mislabeled a clean z=2 envelope as z=1. The z=2 fit is high (clears RECHARGE_MIN_FIT)
+        // and clearly beats z=1, so the genuine re-charge fires despite detector-charge loyalty — this
+        // is the light-z2 charge-halving recovery that must survive the loyalty margin + floor.
+        let (mz, inten, anchor) = synthetic_envelope(1246.0, 2);
+        let (z, _, cos) =
+            best_charge_by_fit(&mz, &inten, anchor, &[1, 2], 20.0, 0.0, 1, RECHARGE_PREFER_MARGIN)
+                .expect("charge");
+        assert_eq!(z, 2, "a clean z=2 fit must override a wrong z=1 detector label");
+        assert!(cos >= RECHARGE_MIN_FIT, "the winning z=2 fit {cos} should clear the floor");
     }
 
     #[test]

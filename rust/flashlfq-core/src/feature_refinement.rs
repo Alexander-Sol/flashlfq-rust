@@ -38,7 +38,7 @@
 use crate::deconvolution::{classic_deconvolute, ClassicDeconvolutionParameters};
 use crate::isotope_shift_decon::{
     best_charge_by_fit, envelope_fit_cosine, shift_decon, shift_decon_gated, shift_decon_in_window,
-    walkback_mono_high_charge,
+    walkback_mono_high_charge, RECHARGE_PREFER_MARGIN,
 };
 use crate::isotopic_envelope::{mass_to_mz_f64, C13_MINUS_C12};
 use crate::peak_indexing::{PeakKey, Scan};
@@ -155,8 +155,18 @@ pub fn refine_feature_shift(
 
     let (refined_charge, refined_mono0) = if recharge {
         let candidates = charge_candidates(feature.charge);
-        let (z, mono, _cos) =
-            best_charge_by_fit(mz, inten, anchor_mz, &candidates, shift_tol_ppm, 0.0)?;
+        // Keep the detector's charge unless another candidate fits clearly better — blocks a spurious
+        // z<->2z harmonic flip in crowded windows (e.g. a real z=2 re-charged to z=4, mass doubled).
+        let (z, mono, _cos) = best_charge_by_fit(
+            mz,
+            inten,
+            anchor_mz,
+            &candidates,
+            shift_tol_ppm,
+            0.0,
+            feature.charge,
+            RECHARGE_PREFER_MARGIN,
+        )?;
         (z, mono)
     } else {
         let r = shift_decon(mz, inten, anchor_mz, feature.charge, shift_tol_ppm)?;
