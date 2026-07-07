@@ -39,6 +39,7 @@
 //! - **Averagine comb weights** (benchmark alternative to Poisson).
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use crate::isotopic_envelope::{C13_MINUS_C12, PROTON_MASS};
 use crate::peak_indexing::{IndexedMassSpectralPeak, PeakIndexingEngine, PeakKey, ScanInfo};
@@ -778,23 +779,27 @@ fn trace_claim_extent(
     peaks
 }
 
-/// Runs the trace-kernel detector over an indexed run.
-///
-/// Seeds are every indexed peak taken tallest-first (the busiest RT regions hold the most signal, so
-/// this maximises explained-signal-per-feature — the coverage objective). For each unclaimed seed,
-/// charge hypotheses `min..=max` are scored and the best-response one wins (cross-z NMS). A
-/// hypothesis is accepted when it observes at least `min_isotopes_observed` teeth and has positive
-/// response; its peaks are then claimed so overlapping harmonics cannot re-fire. Returns the detected
-/// features in acceptance order (tallest-seed first).
 pub fn detect_features(
     engine: &PeakIndexingEngine,
     params: &TraceKernelParameters,
 ) -> Vec<DetectedFeature> {
     let ppm = PpmTolerance::new(params.ppm_tolerance);
 
+    // Opt-in sub-stage profiling (env `DETECT_PROFILE=1`). All timing work is gated behind this
+    // bool, read once here, so the default path pays only a predictable-branch check per section —
+    // no `Instant::now()` in the hot loop unless profiling is explicitly requested.
+    let profile = std::env::var("DETECT_PROFILE").is_ok();
+    let prof_t0 = Instant::now();
+    let mut t_window = 0.0f64;
+    let mut t_score = 0.0f64;
+    let mut t_trace = 0.0f64;
+    let mut n_seed_considered = 0u64;
+    let mut n_score_calls = 0u64;
+
     // Seeds: all peaks, tallest first. Stable ordering (intensity desc) mirrors get_all_xics.
     let mut seeds = engine.all_peaks();
     seeds.sort_by(|a, b| b.intensity.total_cmp(&a.intensity));
+    let t_seed_prep = prof_t0.elapsed().as_secs_f64();
 
     // Coverage bookkeeping: denominator = Σ all peak intensities; stop once the claimed fraction
     // reaches `coverage_target`. The sum is only needed when the cap is actually engaged
@@ -823,16 +828,27 @@ pub fn detect_features(
         if claimed.contains(&seed.key()) {
             continue;
         }
+        if profile {
+            n_seed_considered += 1;
+        }
 
         // The RT window (scan indices + Gaussian weights) is charge-independent — compute it once
         // per seed and share it across every charge hypothesis.
+        let ts = if profile { Some(Instant::now()) } else { None };
         let window = seed_rt_window(engine, seed, params);
+        if let Some(ts) = ts {
+            t_window += ts.elapsed().as_secs_f64();
+        }
 
         // Score every charge hypothesis; keep the highest response (cross-z non-max suppression).
+        let ts = if profile { Some(Instant::now()) } else { None };
         let mut best: Option<HypothesisScore> = None;
         for z in params.min_charge..=params.max_charge {
             if z == 0 {
                 continue;
+            }
+            if profile {
+                n_score_calls += 1;
             }
             let score = score_hypothesis(engine, seed, z, params, &ppm, &claimed, &window);
             let better = match &best {
@@ -842,6 +858,9 @@ pub fn detect_features(
             if better {
                 best = Some(score);
             }
+        }
+        if let Some(ts) = ts {
+            t_score += ts.elapsed().as_secs_f64();
         }
 
         let best = match best {
@@ -857,7 +876,11 @@ pub fn detect_features(
 
         // Claim the feature's TRUE traced extent (not just the narrow scored window), so the whole
         // elution is claimed at once and its smaller adjacent seeds cannot re-fire as fragments.
+        let ts = if profile { Some(Instant::now()) } else { None };
         let traced = trace_claim_extent(engine, seed, &best, params, &ppm, &claimed);
+        if let Some(ts) = ts {
+            t_trace += ts.elapsed().as_secs_f64();
+        }
 
         // Chromatographic-persistence gate: a real elution spans several scans; a feature whose
         // traced extent covers fewer than `min_feature_scans` distinct scans is a single-scan noise
@@ -882,6 +905,28 @@ pub fn detect_features(
         if explained_intensity >= coverage_stop {
             break;
         }
+    }
+
+    if profile {
+        let total = prof_t0.elapsed().as_secs_f64();
+        eprintln!(
+            "  [DETECT_PROFILE] total {:.2}s | seed_prep(all_peaks+sort) {:.2}s | \
+             rt_window {:.2}s | score_hypothesis {:.2}s | trace_claim {:.2}s | \
+             other {:.2}s",
+            total,
+            t_seed_prep,
+            t_window,
+            t_score,
+            t_trace,
+            (total - t_seed_prep - t_window - t_score - t_trace).max(0.0),
+        );
+        eprintln!(
+            "  [DETECT_PROFILE] seeds_considered(unclaimed) {} | score_hypothesis calls {} | \
+             features {}",
+            n_seed_considered,
+            n_score_calls,
+            features.len(),
+        );
     }
 
     features

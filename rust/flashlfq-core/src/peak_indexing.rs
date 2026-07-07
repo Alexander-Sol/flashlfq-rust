@@ -238,21 +238,45 @@ impl PeakIndexingEngine {
     /// tolerance. Returns `None` if no peak qualifies.
     ///
     /// Faithful port of `IndexingEngine<T>.GetIndexedPeak` (the m/z, charge-less path).
+    ///
+    /// Hot-path note: this is the detector's single most-called routine (>10^8 calls on a
+    /// dense run). It is written to iterate the candidate bins directly — no intermediate
+    /// `Vec<&bin>` / `Vec<isize>` allocations — while preserving the exact bin traversal order
+    /// (`floor..=ceil`) and the strict-`<` "closest to `m`" tie-break of the original
+    /// `get_bins_in_range` + `get_best_peak_from_bins` composition.
     pub fn get_indexed_peak(
         &self,
         m: f64,
         zero_based_scan_index: i32,
         ppm: &PpmTolerance,
     ) -> Option<&IndexedMassSpectralPeak> {
-        let bins = self.get_bins_in_range(m, ppm);
-        if bins.is_empty() {
-            return None;
+        let ceiling_mz = (ppm.get_maximum_value(m) * BINS_PER_DALTON).ceil() as i64;
+        let floor_mz = (ppm.get_minimum_value(m) * BINS_PER_DALTON).floor() as i64;
+        let mut best_peak: Option<&IndexedMassSpectralPeak> = None;
+        for j in floor_mz..=ceiling_mz {
+            if j < 0 || j as usize >= self.indexed_peaks.len() {
+                continue;
+            }
+            let bin = match &self.indexed_peaks[j as usize] {
+                Some(b) => b,
+                None => continue,
+            };
+            let peak_index = Self::binary_search_for_indexed_peak(bin, zero_based_scan_index);
+            let temp_peak =
+                match Self::get_peak_from_bin(bin, m, zero_based_scan_index, peak_index, ppm) {
+                    Some(p) => p,
+                    None => continue,
+                };
+            match best_peak {
+                None => best_peak = Some(temp_peak),
+                Some(b) => {
+                    if (temp_peak.m() as f64 - m).abs() < (b.m() as f64 - m).abs() {
+                        best_peak = Some(temp_peak);
+                    }
+                }
+            }
         }
-        let peak_indices: Vec<isize> = bins
-            .iter()
-            .map(|b| Self::binary_search_for_indexed_peak(b, zero_based_scan_index))
-            .collect();
-        Self::get_best_peak_from_bins(&bins, m, zero_based_scan_index, &peak_indices, ppm)
+        best_peak
     }
 
     /// Traces a peak of m/z `m` across retention time, beginning at the scan just before
