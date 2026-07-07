@@ -133,6 +133,10 @@ pub struct ResolvedFeature {
 /// envelope best fits *and* explains the window wins. This recovers charge-halved features (a real
 /// z=2 the detector labelled z=1) and rejects the doubled-mass harmonic, by maximising the unified
 /// fit/explained/completeness metric rather than trusting the detector's charge.
+///
+/// `average_spectra` gates whether the averaged composite is built at all. With `use_apex` set the
+/// composite is never read, so pass `average_spectra = false` to skip building it entirely; pass
+/// `true` to preserve the classic composite path.
 pub fn refine_feature_shift(
     feature: &DetectedFeature,
     scans: &[Scan],
@@ -140,6 +144,7 @@ pub fn refine_feature_shift(
     shift_tol_ppm: f64,
     use_apex: bool,
     recharge: bool,
+    average_spectra: bool,
 ) -> Option<RefinedFeature> {
     refine_feature_shift_inner(
         feature,
@@ -149,6 +154,7 @@ pub fn refine_feature_shift(
         use_apex,
         recharge,
         &[],
+        average_spectra,
     )
 }
 
@@ -158,7 +164,8 @@ pub fn refine_feature_shift(
 /// low-scoring feature in a crowded window is judged on the signal plausibly its own — a competing
 /// charge cannot borrow a neighbour's peaks (the z↔2z harmonic), and the walk-back cannot anchor on a
 /// neighbour's peak. Experiment path (pipeline `NEIGHBOR_REFINE`). With `neighbor_mz` empty this is
-/// exactly [`refine_feature_shift`].
+/// exactly [`refine_feature_shift`]. `average_spectra` gates building the averaged composite (see
+/// [`refine_feature_shift`]).
 pub fn refine_feature_shift_neighbor(
     feature: &DetectedFeature,
     scans: &[Scan],
@@ -167,6 +174,7 @@ pub fn refine_feature_shift_neighbor(
     use_apex: bool,
     recharge: bool,
     neighbor_mz: &[f64],
+    average_spectra: bool,
 ) -> Option<RefinedFeature> {
     refine_feature_shift_inner(
         feature,
@@ -176,6 +184,7 @@ pub fn refine_feature_shift_neighbor(
         use_apex,
         recharge,
         neighbor_mz,
+        average_spectra,
     )
 }
 
@@ -188,8 +197,9 @@ fn refine_feature_shift_inner(
     use_apex: bool,
     recharge: bool,
     neighbor_mz: &[f64],
+    average_spectra: bool,
 ) -> Option<RefinedFeature> {
-    let s = build_feature_slices(feature, scans, averaging_params)?;
+    let s = build_feature_slices(feature, scans, averaging_params, average_spectra)?;
     // Detector's own most-abundant claimed peak — the anchor that cannot grab a foreign peak.
     let anchor_mz = feature
         .peaks
@@ -700,10 +710,17 @@ struct FeatureSlices {
 /// Builds the averaged apex±1 composite and the apex-scan slice for a feature, over the same m/z
 /// window [`refine_feature`] uses. Returns `None` on the same degenerate conditions
 /// (`refine_feature` would also return `None`): empty scans/peaks, empty window, or empty composite.
+///
+/// When `average_spectra` is `false` the composite is **not** computed at all — no window slicing,
+/// no [`crate::spectral_averaging::average_spectra`] call — and `comp_mz`/`comp_int` come back empty.
+/// This is the apex-only fast path: callers that read only the apex slice (e.g. `shift_apex`) pay
+/// nothing for a composite they would ignore. Consumers of the composite must treat empty
+/// `comp_mz`/`comp_int` as "no composite present" and fall back to the apex slice.
 fn build_feature_slices(
     feature: &DetectedFeature,
     scans: &[Scan],
     averaging_params: &SpectralAveragingParameters,
+    average_spectra: bool,
 ) -> Option<FeatureSlices> {
     if scans.is_empty() || feature.peaks.is_empty() {
         return None;
@@ -722,24 +739,32 @@ fn build_feature_slices(
     let slice_lo = range_min0 - 0.5;
     let slice_hi = range_max + 0.5;
 
-    let window = &scans[lo..=hi];
-    let mut x_arrays: Vec<Vec<f64>> = Vec::with_capacity(window.len());
-    let mut y_arrays: Vec<Vec<f64>> = Vec::with_capacity(window.len());
-    for s in window {
-        let a = s.mz.partition_point(|&m| m < slice_lo);
-        let b = s.mz.partition_point(|&m| m <= slice_hi);
-        x_arrays.push(s.mz[a..b].to_vec());
-        y_arrays.push(s.intensity[a..b].to_vec());
-    }
-    if x_arrays.iter().all(|x| x.is_empty()) {
-        return None;
-    }
-
-    let (comp_mz, comp_int) = average_spectra(&x_arrays, &y_arrays, averaging_params);
-    if comp_mz.is_empty() {
-        return None;
-    }
-    let range_min_comp = range_min0.max(comp_mz[0]);
+    // Averaged apex±1 composite — built only when requested. In apex-only mode the composite is
+    // never read downstream, so slicing every window scan and averaging is skipped entirely.
+    let (comp_mz, comp_int, range_min_comp) = if average_spectra {
+        let window = &scans[lo..=hi];
+        let mut x_arrays: Vec<Vec<f64>> = Vec::with_capacity(window.len());
+        let mut y_arrays: Vec<Vec<f64>> = Vec::with_capacity(window.len());
+        for s in window {
+            let a = s.mz.partition_point(|&m| m < slice_lo);
+            let b = s.mz.partition_point(|&m| m <= slice_hi);
+            x_arrays.push(s.mz[a..b].to_vec());
+            y_arrays.push(s.intensity[a..b].to_vec());
+        }
+        if x_arrays.iter().all(|x| x.is_empty()) {
+            return None;
+        }
+        let (comp_mz, comp_int) =
+            crate::spectral_averaging::average_spectra(&x_arrays, &y_arrays, averaging_params);
+        if comp_mz.is_empty() {
+            return None;
+        }
+        let range_min_comp = range_min0.max(comp_mz[0]);
+        (comp_mz, comp_int, range_min_comp)
+    } else {
+        // No composite: placeholder floor (unused by the apex-only path).
+        (Vec::new(), Vec::new(), range_min0)
+    };
 
     // Apex-scan slice over the same m/z window.
     let apex_usize = (feature.apex_scan_index.max(0) as usize).min(scans.len() - 1);
@@ -903,7 +928,8 @@ fn four_way_decon_inner(
         .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
         .map(|p| p.m() as f64);
 
-    if let Some(s) = build_feature_slices(feature, scans, averaging_params) {
+    // The four-way agreement compares composite and apex views, so the composite is always built here.
+    if let Some(s) = build_feature_slices(feature, scans, averaging_params, true) {
         // Classic composite.
         if let Some((mono, score)) = pick_classic_mono(
             &s.comp_mz,
