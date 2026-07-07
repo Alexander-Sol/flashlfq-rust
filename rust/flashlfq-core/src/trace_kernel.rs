@@ -39,7 +39,7 @@
 //! - **Averagine comb weights** (benchmark alternative to Poisson).
 
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::isotopic_envelope::{C13_MINUS_C12, PROTON_MASS};
 use crate::peak_indexing::{IndexedMassSpectralPeak, PeakIndexingEngine, PeakKey, ScanInfo};
@@ -779,6 +779,72 @@ fn trace_claim_extent(
     peaks
 }
 
+/// Opt-in live progress reporter for the detect loop (env `DETECT_PROGRESS`). Loop-local and
+/// non-`Sync`: constructed once before the serial acceptance walk, mutated only from that walk.
+///
+/// Throttled so the hot path pays only a single integer compare per accepted feature before any
+/// `Instant::now()`/formatting: emit only after both `every_seeds` seeds AND `every` wall-time have
+/// elapsed since the last line. Output is a single greppable stderr line prefixed
+/// `[DETECT_PROGRESS]`; the feature TSV (stdout/files) is never touched.
+struct DetectProgress {
+    enabled: bool,
+    every_seeds: u64,
+    every: Duration,
+    start_time: Instant,
+    last_emit_seeds: u64,
+    last_emit_time: Instant,
+    total_tic: f64,
+    pool_total: usize,
+}
+
+impl DetectProgress {
+    /// Throttled emit. Ordered cheapest-check-first so the common (no-emit) path is a single
+    /// integer subtraction+compare and never calls `Instant::now()` or allocates.
+    fn maybe_emit(&mut self, seeds_considered: u64, accepted: usize, explained: f64) {
+        if !self.enabled {
+            return;
+        }
+        if seeds_considered.saturating_sub(self.last_emit_seeds) < self.every_seeds {
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last_emit_time) < self.every {
+            return;
+        }
+        self.last_emit_seeds = seeds_considered;
+        self.last_emit_time = now;
+        self.emit(seeds_considered, accepted, explained);
+    }
+
+    /// Unconditional emit (used for the final line at loop exit); still gated on `enabled`.
+    fn final_emit(&self, seeds_considered: u64, accepted: usize, explained: f64) {
+        if self.enabled {
+            self.emit(seeds_considered, accepted, explained);
+        }
+    }
+
+    fn emit(&self, seeds_considered: u64, accepted: usize, explained: f64) {
+        let pool_total = self.pool_total as u64;
+        let pool_remaining = pool_total.saturating_sub(seeds_considered.min(pool_total));
+        let pct = if self.total_tic > 0.0 {
+            100.0 * explained / self.total_tic
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[DETECT_PROGRESS] seeds {}/{} (pool_remaining {}) | accepted {} | \
+             TIC {:.2e} ({:.1}% of ΣTIC) | {:.1}s",
+            seeds_considered,
+            pool_total,
+            pool_remaining,
+            accepted,
+            explained,
+            pct,
+            self.start_time.elapsed().as_secs_f64(),
+        );
+    }
+}
+
 pub fn detect_features(
     engine: &PeakIndexingEngine,
     params: &TraceKernelParameters,
@@ -801,25 +867,49 @@ pub fn detect_features(
     seeds.sort_by(|a, b| b.intensity.total_cmp(&a.intensity));
     let t_seed_prep = prof_t0.elapsed().as_secs_f64();
 
-    // Coverage bookkeeping: denominator = Σ all peak intensities; stop once the claimed fraction
-    // reaches `coverage_target`. The sum is only needed when the cap is actually engaged
-    // (`coverage_target < 1.0`), so skip the O(peaks) pass for the common "detect everything" case.
-    let coverage_stop = if params.coverage_target < 1.0 {
-        let total_intensity: f64 = seeds.iter().map(|p| p.intensity as f64).sum();
-        if total_intensity > 0.0 {
-            params.coverage_target * total_intensity
-        } else {
-            f64::INFINITY
-        }
+    // Opt-in live progress reporting (env `DETECT_PROGRESS`; throttle override `DETECT_PROGRESS_EVERY`
+    // in seeds, default 50_000). Read once here so the hot loop only checks a bool.
+    let progress_enabled = std::env::var("DETECT_PROGRESS").is_ok();
+    let progress_every: u64 = std::env::var("DETECT_PROGRESS_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(50_000);
+
+    // Coverage bookkeeping: denominator = Σ all peak intensities (ΣTIC). The sum is only needed when
+    // a consumer engages — the coverage cap (`coverage_target < 1.0`) OR live progress reporting — so
+    // the common "detect everything, no progress" default still skips the O(peaks) pass.
+    let need_total_tic = params.coverage_target < 1.0 || progress_enabled;
+    let total_intensity: f64 = if need_total_tic {
+        seeds.iter().map(|p| p.intensity as f64).sum()
+    } else {
+        0.0
+    };
+    let coverage_stop = if params.coverage_target < 1.0 && total_intensity > 0.0 {
+        params.coverage_target * total_intensity
     } else {
         f64::INFINITY
     };
+
+    let mut progress = DetectProgress {
+        enabled: progress_enabled,
+        every_seeds: progress_every,
+        every: Duration::from_millis(500),
+        start_time: prof_t0,
+        last_emit_seeds: 0,
+        last_emit_time: prof_t0,
+        total_tic: total_intensity,
+        pool_total: seeds.len(),
+    };
+
     let mut explained_intensity = 0.0;
 
     let mut claimed: HashSet<PeakKey> = HashSet::new();
     let mut features: Vec<DetectedFeature> = Vec::new();
+    let mut seeds_visited: u64 = 0;
 
-    for seed in &seeds {
+    for (seed_idx, seed) in seeds.iter().enumerate() {
+        seeds_visited = seed_idx as u64 + 1;
         // Seeds are intensity-descending, so once we fall below the floor every remaining seed is
         // too — stop rather than continue.
         if (seed.intensity as f64) < params.min_seed_intensity {
@@ -901,11 +991,17 @@ pub fn detect_features(
         explained_intensity += feature.summed_intensity;
         features.push(feature);
 
+        // Live progress (throttled, opt-in; no-op on the default path).
+        progress.maybe_emit(seed_idx as u64 + 1, features.len(), explained_intensity);
+
         // Stop once we have explained the target fraction of the total MS1 signal.
         if explained_intensity >= coverage_stop {
             break;
         }
     }
+
+    // Final progress line at loop exit (regardless of throttle), so the last state is always logged.
+    progress.final_emit(seeds_visited, features.len(), explained_intensity);
 
     if profile {
         let total = prof_t0.elapsed().as_secs_f64();
