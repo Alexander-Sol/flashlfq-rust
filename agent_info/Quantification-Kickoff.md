@@ -1,5 +1,13 @@
 # Quantification — Kick-off (scoping + benchmark design)
 
+> **STATUS (2026-07-07): DEFERRED — do not start quant work yet (per Alex).**
+> Quantification is on hold until features have been **matched to peptides** first. Once a feature
+> carries a peptide/amino-acid composition, abundance should come from an **NNLS fit against the
+> precise, composition-specific isotope envelope** rather than an averagine model — composition-exact
+> envelopes are more accurate than averagine, so fitting before ID would bake in avoidable error.
+> Treat the plan below as background scoping only; the recommended "build intensity now on CA/Lumos"
+> first step is **superseded** by this decision. Revisit after feature↔peptide matching exists.
+
 Scopes the quantification work for the untargeted MS1 feature-detection pipeline: what
 "quantification" means here, the current state of the code, proposed test cases, a head-to-head
 benchmark against FlashLFQ classic, and a phased plan. Companion to
