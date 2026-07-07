@@ -155,6 +155,20 @@ pub struct TraceKernelParameters {
     /// point of Change A is to claim a real elution wider than 2σ, so this bounds only pathological
     /// traces, not real peaks.
     pub trace_max_half_width_minutes: f64,
+    /// **Opt-in, default `false`.** Auto-stop the seed walk at the *knee* of the coverage curve —
+    /// where the marginal %ΣTIC claimed per seed collapses. Because seeds are visited tallest-first
+    /// the marginal claim is monotonically non-increasing (the curve is concave by construction), so
+    /// a rolling 2-point slope suffices. A pure speed/recall knob, not a correctness fix: it trades
+    /// the low-abundance tail (the bulk of seeds/wall-clock) for early exit. `false` => never stops
+    /// early (byte-identical to the un-instrumented detector).
+    pub knee_stop_enabled: bool,
+    /// Width (in seeds visited) of the rolling window over which the knee slope is measured.
+    pub knee_window_seeds: usize,
+    /// Stop when the current window's slope falls below this fraction of the FIRST window's slope.
+    pub knee_slope_frac: f64,
+    /// Absolute floor on the rolling slope (fraction of ΣTIC per seed) below which the tail is flat
+    /// enough to stop regardless of the relative test.
+    pub knee_abs_eps: f64,
 }
 
 impl Default for TraceKernelParameters {
@@ -182,6 +196,10 @@ impl Default for TraceKernelParameters {
             rt_half_window_minutes: 0.5,
             trace_missed_scans_allowed: 1,
             trace_max_half_width_minutes: 0.5,
+            knee_stop_enabled: false,
+            knee_window_seeds: 20_000,
+            knee_slope_frac: 0.02,
+            knee_abs_eps: 1e-7,
         }
     }
 }
@@ -845,6 +863,61 @@ impl DetectProgress {
     }
 }
 
+/// Opt-in auto-stop at the *knee* of the coverage curve (params `knee_stop_enabled`; driver env
+/// `DETECT_KNEE`). Loop-local, non-`Sync`, constructed once before the serial acceptance walk.
+///
+/// Since seeds are visited tallest-first, the marginal %ΣTIC claimed per seed is monotonically
+/// non-increasing — the explained-vs-seeds curve is concave — so a rolling 2-point slope over a
+/// fixed seed window captures the knee with O(1) state (no history buffer). `observe` returns `true`
+/// exactly once, when the loop should break.
+struct KneeDetector {
+    enabled: bool,
+    window_seeds: u64,
+    slope_frac: f64,
+    abs_eps: f64,
+    total_tic: f64,
+    win_start_seeds: u64,
+    win_start_explained: f64,
+    early_slope: Option<f64>,
+    windows_seen: u32,
+}
+
+impl KneeDetector {
+    /// Feed the running (seeds_considered, explained) state. Returns `true` when the rolling slope
+    /// has collapsed — below `slope_frac × early_slope` (relative) OR below `abs_eps` (absolute,
+    /// flat tail) — but only after at least two full windows have elapsed (the first sets the
+    /// reference slope). A no-op returning `false` when disabled.
+    fn observe(&mut self, seeds_considered: u64, explained: f64) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let dseeds = seeds_considered.saturating_sub(self.win_start_seeds);
+        if dseeds < self.window_seeds {
+            return false;
+        }
+        // A full window elapsed: rolling slope = Δexplained/Δseeds, normalised by ΣTIC so it reads
+        // as a fraction of total signal claimed per seed.
+        let denom = if self.total_tic > 0.0 { self.total_tic } else { 1.0 };
+        let rolling_slope = (explained - self.win_start_explained) / dseeds as f64 / denom;
+        self.windows_seen += 1;
+        // Advance the window origin for the next window.
+        self.win_start_seeds = seeds_considered;
+        self.win_start_explained = explained;
+        // The first completed window only establishes the reference slope; never stop on it.
+        let early = match self.early_slope {
+            None => {
+                self.early_slope = Some(rolling_slope);
+                return false;
+            }
+            Some(s) => s,
+        };
+        if self.windows_seen < 2 {
+            return false;
+        }
+        rolling_slope < self.slope_frac * early || rolling_slope < self.abs_eps
+    }
+}
+
 pub fn detect_features(
     engine: &PeakIndexingEngine,
     params: &TraceKernelParameters,
@@ -877,9 +950,11 @@ pub fn detect_features(
         .unwrap_or(50_000);
 
     // Coverage bookkeeping: denominator = Σ all peak intensities (ΣTIC). The sum is only needed when
-    // a consumer engages — the coverage cap (`coverage_target < 1.0`) OR live progress reporting — so
-    // the common "detect everything, no progress" default still skips the O(peaks) pass.
-    let need_total_tic = params.coverage_target < 1.0 || progress_enabled;
+    // a consumer engages — the coverage cap (`coverage_target < 1.0`), live progress reporting, OR
+    // the knee auto-stop — so the common "detect everything, no progress" default still skips the
+    // O(peaks) pass.
+    let need_total_tic =
+        params.coverage_target < 1.0 || progress_enabled || params.knee_stop_enabled;
     let total_intensity: f64 = if need_total_tic {
         seeds.iter().map(|p| p.intensity as f64).sum()
     } else {
@@ -901,6 +976,20 @@ pub fn detect_features(
         total_tic: total_intensity,
         pool_total: seeds.len(),
     };
+
+    // Opt-in auto-stop at the coverage knee (params `knee_stop_enabled`; default OFF).
+    let mut knee = KneeDetector {
+        enabled: params.knee_stop_enabled,
+        window_seeds: params.knee_window_seeds.max(1) as u64,
+        slope_frac: params.knee_slope_frac,
+        abs_eps: params.knee_abs_eps,
+        total_tic: total_intensity,
+        win_start_seeds: 0,
+        win_start_explained: 0.0,
+        early_slope: None,
+        windows_seen: 0,
+    };
+    let knee_log = progress_enabled || params.knee_stop_enabled;
 
     let mut explained_intensity = 0.0;
 
@@ -996,6 +1085,26 @@ pub fn detect_features(
 
         // Stop once we have explained the target fraction of the total MS1 signal.
         if explained_intensity >= coverage_stop {
+            break;
+        }
+
+        // Auto-stop at the coverage knee (opt-in; can fire earlier than the coverage target).
+        if knee.observe(seed_idx as u64 + 1, explained_intensity) {
+            if knee_log {
+                let pct = if total_intensity > 0.0 {
+                    100.0 * explained_intensity / total_intensity
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[DETECT_KNEE] stopping at seed {}/{} | accepted {} | {:.1}% of ΣTIC | {:.1}s",
+                    seed_idx as u64 + 1,
+                    seeds.len(),
+                    features.len(),
+                    pct,
+                    prof_t0.elapsed().as_secs_f64(),
+                );
+            }
             break;
         }
     }
@@ -1638,5 +1747,110 @@ mod tests {
             (fallback / 60.0) / FWHM_TO_SIGMA,
             1e-9,
         );
+    }
+
+    #[test]
+    fn knee_detector_stops_on_concave_sequence() {
+        // Saturating (concave) coverage curve explained(s) = TOTAL*(1 - exp(-s/tau)). Sampling at
+        // window boundaries s = k*W (with W = tau) gives a per-window slope ratio r_k = exp(-(k-1))
+        // versus the first window. For slope_frac = 0.02 the first window with r_k < 0.02 is k=5
+        // (r_5 = exp(-4) ≈ 0.0183), so the detector must first return true at seed 5*W.
+        let total = 1.0_f64;
+        let w = 100u64;
+        let tau = 100.0_f64;
+        let mut knee = KneeDetector {
+            enabled: true,
+            window_seeds: w,
+            slope_frac: 0.02,
+            abs_eps: 1e-9,
+            total_tic: total,
+            win_start_seeds: 0,
+            win_start_explained: 0.0,
+            early_slope: None,
+            windows_seen: 0,
+        };
+        let explained = |s: f64| total * (1.0 - (-s / tau).exp());
+        let mut stopped_at: Option<u64> = None;
+        for k in 1..=6u64 {
+            let seeds = k * w;
+            if knee.observe(seeds, explained(seeds as f64)) {
+                stopped_at = Some(k);
+                break;
+            }
+        }
+        assert_eq!(
+            stopped_at,
+            Some(5),
+            "knee should first fire at window k=5 for slope_frac=0.02"
+        );
+
+        // Absolute-floor (flatline) path: with slope_frac = 0 the relative test can never fire on a
+        // positive slope, so a near-flat tail must stop solely via abs_eps.
+        let mut flat = KneeDetector {
+            enabled: true,
+            window_seeds: 10,
+            slope_frac: 0.0,
+            abs_eps: 1e-3,
+            total_tic: 1.0,
+            win_start_seeds: 0,
+            win_start_explained: 0.0,
+            early_slope: None,
+            windows_seen: 0,
+        };
+        assert!(!flat.observe(10, 0.5), "first window only sets the reference slope");
+        // Second window slope ≈ 1e-5/seed << abs_eps 1e-3 (and relative test disabled) => stop.
+        assert!(flat.observe(20, 0.5001), "flat tail must stop via abs_eps");
+    }
+
+    #[test]
+    fn knee_detector_disabled_never_stops() {
+        // Disabled detector must return false forever, even with thresholds that would trivially
+        // fire (tiny window, huge slope_frac/abs_eps) on a flat sequence.
+        let mut knee = KneeDetector {
+            enabled: false,
+            window_seeds: 1,
+            slope_frac: 1.0,
+            abs_eps: 1.0,
+            total_tic: 1.0,
+            win_start_seeds: 0,
+            win_start_explained: 0.0,
+            early_slope: None,
+            windows_seen: 0,
+        };
+        for k in 1..=1000u64 {
+            assert!(!knee.observe(k, 0.0), "disabled knee must never stop");
+        }
+    }
+
+    #[test]
+    fn knee_default_params_do_not_change_detection() {
+        // Default params have the knee disabled: detection on the synthetic z=2 fixture must be
+        // identical whether the (present-but-disabled) knee fields hold their defaults or arbitrary
+        // values — proving the added fields are byte-identical no-ops on the default path.
+        let (scans, _mono_mz) = synthetic_envelope_scans();
+        let engine = PeakIndexingEngine::index_peaks(&scans).expect("indexed");
+        let p_default = TraceKernelParameters {
+            ppm_tolerance: 5.0,
+            rt_sigma_minutes: 0.15,
+            half_window_scans: 4,
+            ..TraceKernelParameters::default()
+        };
+        let p_knee_off = TraceKernelParameters {
+            knee_window_seeds: 1,
+            knee_slope_frac: 0.9,
+            knee_abs_eps: 1.0,
+            ..p_default
+        };
+        let a = detect_features(&engine, &p_default);
+        let b = detect_features(&engine, &p_knee_off);
+        assert_eq!(a.len(), b.len(), "disabled knee must not change feature count");
+        for (fa, fb) in a.iter().zip(b.iter()) {
+            approx(fa.monoisotopic_mass, fb.monoisotopic_mass, 1e-9);
+            assert_eq!(fa.charge, fb.charge);
+        }
+        // Sanity: the default run still detects the known charge-2, mass-1000 envelope.
+        assert!(!a.is_empty());
+        assert_eq!(a[0].charge, 2);
+        approx(a[0].monoisotopic_mass, 1000.0, 0.01);
     }
 }

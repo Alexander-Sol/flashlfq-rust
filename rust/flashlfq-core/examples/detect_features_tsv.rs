@@ -360,6 +360,24 @@ fn main() {
     // least-squares fit); SCORE_COSINE=1 divides additionally by ‖I‖ for a bounded cosine shape-fit.
     let score_use_seed_amplitude = matches!(std::env::var("AMP_SEED").as_deref(), Ok("1") | Ok("true"));
     let score_cosine = matches!(std::env::var("SCORE_COSINE").as_deref(), Ok("1") | Ok("true"));
+    // Auto-stop at the coverage knee (opt-in; default OFF). DETECT_KNEE=1 enables it; the marginal
+    // %ΣTIC-per-seed collapse is a speed/recall knob (sacrifices the low-abundance tail), not a
+    // correctness fix. DETECT_KNEE_FRAC = stop-below fraction of the early-window slope (default
+    // 0.02); DETECT_KNEE_WINDOW = rolling window width in seeds (default 20000); DETECT_KNEE_EPS =
+    // absolute flat-tail slope floor (fraction of ΣTIC per seed, default 1e-7).
+    let knee_stop_enabled = matches!(std::env::var("DETECT_KNEE").as_deref(), Ok("1") | Ok("true"));
+    let knee_slope_frac = std::env::var("DETECT_KNEE_FRAC")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.02);
+    let knee_window_seeds = std::env::var("DETECT_KNEE_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(20_000);
+    let knee_abs_eps = std::env::var("DETECT_KNEE_EPS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1e-7);
     let base = TraceKernelParameters {
         ppm_tolerance: 10.0,
         min_seed_intensity,
@@ -372,8 +390,18 @@ fn main() {
         trace_missed_scans_allowed: trace_missed,
         trace_max_half_width_minutes: trace_half_width_min,
         min_feature_scans,
+        knee_stop_enabled,
+        knee_window_seeds,
+        knee_slope_frac,
+        knee_abs_eps,
         ..TraceKernelParameters::default()
     };
+    if knee_stop_enabled {
+        eprintln!(
+            "knee auto-stop: ENABLED (window {} seeds, slope_frac {}, abs_eps {:.0e}) — stops early at the coverage knee",
+            knee_window_seeds, knee_slope_frac, knee_abs_eps
+        );
+    }
     eprintln!(
         "score model: {:?}  (η = {:.1} @ p{:.0}, A = {}, {})",
         score_model,
