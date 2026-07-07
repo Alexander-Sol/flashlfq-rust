@@ -435,7 +435,21 @@ fn main() {
     }
 
     // --- refine --------------------------------------------------------------------------------
-    let avg = flashlfq_core::spectral_averaging::SpectralAveragingParameters::default();
+    let mut avg = flashlfq_core::spectral_averaging::SpectralAveragingParameters::default();
+    // Derive the composite averaging window from the run's measured FWHM (recovered from the σ the
+    // detector set) and MS1 scan spacing, instead of the fixed apex±1 floor. Only affects methods
+    // that actually build a composite (shift_composite / classic); the default apex-only path
+    // (shift_apex, average_spectra=false) never reads it, so this leaves the default output unchanged.
+    {
+        let fwhm_seconds = params.rt_sigma_minutes * FWHM_TO_SIGMA * 60.0;
+        let spacing_seconds = median_ms1_scan_spacing_minutes(engine.scan_info()) * 60.0;
+        avg.avg_scans =
+            flashlfq_core::feature_refinement::derived_avg_scans(fwhm_seconds, spacing_seconds);
+        eprintln!(
+            "  refine averaging window: {} scans (FWHM {:.2} s / spacing {:.3} s)",
+            avg.avg_scans, fwhm_seconds, spacing_seconds
+        );
+    }
     let decon = ClassicDeconvolutionParameters::new(
         params.min_charge,
         params.max_charge,

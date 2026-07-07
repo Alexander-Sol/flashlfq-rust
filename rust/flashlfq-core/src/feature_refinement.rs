@@ -51,11 +51,36 @@ use std::collections::{HashMap, HashSet};
 /// real mass precision. Applied as `max(mass · ppm/1e6, MASS_CLUSTER_ABS_FLOOR_DA)`.
 pub const MASS_CLUSTER_ABS_FLOOR_DA: f64 = 0.01;
 
-/// Hard cap on how many MS1 scans [`refine_feature`] averages into the composite. The composite is a
-/// high-SNR snapshot at the feature apex, so this stays small — just the apex plus one scan on either
-/// side; averaging more pulls in co-eluting interference. A `> MAX_SCANS_TO_AVERAGE` window is treated
-/// as a bug (asserted), not silently accepted.
+/// **Floor** (minimum, no longer a fixed value) for how many MS1 scans [`refine_feature`] averages
+/// into the composite. The composite is a high-SNR snapshot at the feature apex; on the short (~10-min)
+/// gradient the peak spans only ~3 scans, so this is the smallest sensible window (apex ± 1). On longer
+/// gradients the window is *widened* from the measured chromatographic FWHM via [`derived_avg_scans`]
+/// (which never returns less than this floor). The refinement window guard asserts the realised scan
+/// count never exceeds the requested (derived) count, catching a mis-computed window as a bug.
 pub const MAX_SCANS_TO_AVERAGE: usize = 3;
+
+/// Number of MS1 scans to average into the refinement composite, derived from the run's measured
+/// chromatographic FWHM and MS1 scan spacing (both seconds). The window is symmetric (apex ±
+/// `n`/2), so the count is snapped to the **nearest odd** integer, and floored at
+/// [`MAX_SCANS_TO_AVERAGE`] (3).
+///
+/// Formula: `round_to_odd(0.8 · FWHM / spacing)`, floor 3. The `0.8·FWHM` span keeps the composite
+/// tight around the apex (roughly the peak's FWHM worth of scans) rather than the detector's wider
+/// ±2σ scoring window, so co-eluting interference is not pulled in. Non-finite or non-positive inputs
+/// (e.g. a run where spacing could not be measured) fall back to the floor.
+///
+/// Verified on the three reference gradients: short 10-min (FWHM≈1.89 s, spacing≈0.384 s) → 3,
+/// medium 65-min (≈9.36 s / 0.93 s) → 9, long 120-min (≈17.66 s / 0.744 s) → 19.
+pub fn derived_avg_scans(fwhm_seconds: f64, scan_spacing_seconds: f64) -> usize {
+    if !fwhm_seconds.is_finite() || !scan_spacing_seconds.is_finite() || scan_spacing_seconds <= 0.0
+    {
+        return MAX_SCANS_TO_AVERAGE;
+    }
+    let raw = 0.8 * fwhm_seconds / scan_spacing_seconds;
+    // Nearest ODD integer: map onto the odd lattice (2k+1), round k, map back.
+    let odd = 2.0 * ((raw - 1.0) / 2.0).round() + 1.0;
+    (odd.max(MAX_SCANS_TO_AVERAGE as f64)) as usize
+}
 
 /// Largest integer ¹³C off-by-one offset tolerated when grouping features by neutral mass. The mono
 /// off-by-one is normally ±1; ±2 is allowed for robustness against a doubly-mis-assigned monoisotope.
@@ -350,18 +375,22 @@ fn refine_feature_inner(
     // default is 5 scans). We deliberately do NOT use the feature's full claimed-peak scan extent:
     // the detector's RT window is ~±2σ, which in dense MS1 regions is ~100 scans.
     let apex = feature.apex_scan_index;
-    let half = (MAX_SCANS_TO_AVERAGE / 2) as i32; // 1 → up to 3 scans (apex ± 1)
+    // Requested averaging count: FWHM-derived (carried on the averaging params), never below the
+    // floor. Symmetric window apex ± want/2 (want is odd, so ±(want-1)/2). Defaults to the floor 3.
+    let want = averaging_params.avg_scans.max(MAX_SCANS_TO_AVERAGE);
+    let half = (want / 2) as i32; // e.g. want=3 → ±1 (3 scans); want=9 → ±4 (9 scans)
     let lo = (apex - half).max(0) as usize;
     let hi = ((apex + half).max(0) as usize).min(scans.len() - 1);
     if lo > hi {
         return None;
     }
-    // Safety invariant: averaging more than a handful of scans means the window logic is wrong.
+    // Safety invariant: the realised window must not exceed the requested (derived) count — a larger
+    // span means the window logic is wrong. (It can be *smaller* at the chromatogram edges.)
     let n_avg = hi - lo + 1;
     assert!(
-        n_avg <= MAX_SCANS_TO_AVERAGE,
-        "refine_feature would average {n_avg} scans (> {MAX_SCANS_TO_AVERAGE}); the averaging \
-         window must stay small — something is wrong with the window computation"
+        n_avg <= want,
+        "refine_feature would average {n_avg} scans (> requested {want}); the averaging \
+         window computation is wrong"
     );
 
     // m/z window around the feature. This is both the deconvolution range AND the slice we average
@@ -726,7 +755,9 @@ fn build_feature_slices(
         return None;
     }
     let apex = feature.apex_scan_index;
-    let half = (MAX_SCANS_TO_AVERAGE / 2) as i32;
+    // FWHM-derived averaging count (see `refine_feature_inner`); floored, symmetric apex ± want/2.
+    let want = averaging_params.avg_scans.max(MAX_SCANS_TO_AVERAGE);
+    let half = (want / 2) as i32;
     let lo = (apex - half).max(0) as usize;
     let hi = ((apex + half).max(0) as usize).min(scans.len() - 1);
     if lo > hi {
@@ -1472,6 +1503,31 @@ mod tests {
     use super::*;
     use crate::deconvolution::Polarity;
     use crate::isotopic_envelope::mass_to_mz_f64;
+
+    #[test]
+    fn derived_avg_scans_matches_reference_gradients() {
+        // Measured (FWHM, spacing) seconds per gradient → nearest-odd(0.8·FWHM/spacing), floor 3.
+        // short 10-min: 0.8·1.89/0.384 = 3.94 → 3
+        assert_eq!(derived_avg_scans(1.89, 0.384), 3);
+        // medium 65-min: 0.8·9.36/0.93 = 8.05 → 9
+        assert_eq!(derived_avg_scans(9.36, 0.93), 9);
+        // long 120-min: 0.8·17.66/0.744 = 18.99 → 19
+        assert_eq!(derived_avg_scans(17.66, 0.744), 19);
+    }
+
+    #[test]
+    fn derived_avg_scans_floors_and_guards() {
+        // Tiny / zero / non-finite inputs fall back to the floor of 3.
+        assert_eq!(derived_avg_scans(0.1, 0.384), MAX_SCANS_TO_AVERAGE);
+        assert_eq!(derived_avg_scans(0.0, 0.384), MAX_SCANS_TO_AVERAGE);
+        assert_eq!(derived_avg_scans(1.89, 0.0), MAX_SCANS_TO_AVERAGE);
+        assert_eq!(derived_avg_scans(f64::NAN, 0.384), MAX_SCANS_TO_AVERAGE);
+        assert_eq!(derived_avg_scans(1.89, f64::INFINITY), MAX_SCANS_TO_AVERAGE);
+        // Result is always odd (symmetric apex ± n/2 window).
+        for &(fwhm, sp) in &[(1.89, 0.384), (9.36, 0.93), (17.66, 0.744), (30.0, 0.5)] {
+            assert_eq!(derived_avg_scans(fwhm, sp) % 2, 1);
+        }
+    }
     use crate::peak_indexing::{IndexedMassSpectralPeak, PeakIndexingEngine};
     use crate::trace_kernel::{detect_features, poisson_comb_weights, TraceKernelParameters};
 

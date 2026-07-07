@@ -104,6 +104,14 @@ pub struct SpectralAveragingParameters {
     pub percentile: f64,
     pub min_sigma_value: f64,
     pub max_sigma_value: f64,
+    /// Number of MS1 scans the feature-refinement composite averages around the apex (symmetric,
+    /// apex ± `avg_scans`/2). Not part of mzLib's averaging config — carried here because this struct
+    /// is already threaded through every `refine_feature*` path, so it is the least invasive place to
+    /// feed refinement a data-derived window. Defaults to the floor
+    /// [`crate::feature_refinement::MAX_SCANS_TO_AVERAGE`] (3); callers that have measured the run's
+    /// chromatographic FWHM set it from [`crate::feature_refinement::derived_avg_scans`]. Consumed
+    /// only when a composite is actually built (`average_spectra = true`).
+    pub avg_scans: usize,
 }
 
 impl Default for SpectralAveragingParameters {
@@ -124,6 +132,10 @@ impl Default for SpectralAveragingParameters {
             percentile: 0.1,
             min_sigma_value: 0.5,
             max_sigma_value: 3.0,
+            // Floor / hard-coded historical value; mirrors `feature_refinement::MAX_SCANS_TO_AVERAGE`.
+            // Kept as a literal to avoid a dependency edge from this low-level module up to
+            // `feature_refinement`; the two are asserted-consistent by `refine_feature`'s window guard.
+            avg_scans: 3,
         }
     }
 }
