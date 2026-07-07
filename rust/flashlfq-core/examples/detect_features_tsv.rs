@@ -470,6 +470,12 @@ fn main() {
     let refine_method = std::env::var("REFINE_METHOD").unwrap_or_else(|_| "shift_apex".to_string());
     let use_shift_apex = refine_method == "shift_apex";
     let use_shift = use_shift_apex || refine_method == "shift_composite";
+    // Apex-only refinement is the default, so the averaged composite is built ONLY when a method
+    // actually reads it (shift_composite). On CA/Lumos 10-min the apex scan beats the averaged
+    // composite: 97.4% vs 96.0% recall, 94.4% vs 92.3% charge accuracy — so we skip the composite
+    // (and its per-scan slicing) in the default apex path. Revisit once data-dependent averaging
+    // lands for longer gradients, where averaging may pay off again.
+    let average_spectra = !use_shift_apex;
     // Charge re-selection by the envelope-fit cosine (fit + explained + completeness) defaults ON for
     // the shift methods; disable with RECHARGE=0. Recovers charge-halved features (the light-z2 class).
     let recharge = std::env::var("RECHARGE")
@@ -499,7 +505,7 @@ fn main() {
             // Pass 1: plain refine, then index the corrected placements for the masked pass below.
             let pass1: Vec<RefinedFeature> = detected
                 .iter()
-                .filter_map(|f| refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge, true))
+                .filter_map(|f| refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge, average_spectra))
                 .collect();
             eprintln!(
                 "  NEIGHBOR_REFINE=refined: two-pass, masking neighbours >= {neighbor_min_ratio}x (from {} refined)",
@@ -531,7 +537,7 @@ fn main() {
         // Pass 1: plain refine to get each feature's initial score.
         let init: Vec<Option<RefinedFeature>> = detected
             .iter()
-            .map(|f| refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge, true))
+            .map(|f| refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge, average_spectra))
             .collect();
         // Process indices in descending initial score.
         let mut order: Vec<usize> = (0..detected.len()).filter(|&i| init[i].is_some()).collect();
@@ -547,7 +553,7 @@ fn main() {
             let win_min = (f.mono_mz - 1.5).max(0.0);
             let win_max = f.mono_mz + (f.num_isotopes_observed as f64 + 3.0) * spacing + 1.0;
             let mask = filter_off_own_grid(locked.positions(f.apex_rt, win_min, win_max), f);
-            let r = refine_feature_shift_neighbor(f, &scans, &avg, 20.0, use_shift_apex, recharge, &mask, true)
+            let r = refine_feature_shift_neighbor(f, &scans, &avg, 20.0, use_shift_apex, recharge, &mask, average_spectra)
                 .or_else(|| init[i].clone());
             if let Some(rr) = &r {
                 // Only confident features become mask sources for the lower-scoring ones that follow.
@@ -568,9 +574,9 @@ fn main() {
         for (i, f) in detected.iter().enumerate() {
             let r = if let Some(idx) = &neighbor_idx {
                 let mask = neighbor_mask_for(idx, f, neighbor_min_ratio);
-                refine_feature_shift_neighbor(f, &scans, &avg, 20.0, use_shift_apex, recharge, &mask, true)
+                refine_feature_shift_neighbor(f, &scans, &avg, 20.0, use_shift_apex, recharge, &mask, average_spectra)
             } else if use_shift {
-                refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge, true)
+                refine_feature_shift(f, &scans, &avg, 20.0, use_shift_apex, recharge, average_spectra)
             } else if censor_claimed {
                 refine_feature_censored(f, &scans, &avg, &decon, &all_claimed)
             } else {
@@ -718,7 +724,8 @@ fn run_refine_diff(
         if refine_feature(f, scans, avg, decon).is_some() {
             continue;
         }
-        if let Some(r) = refine_feature_shift(f, scans, avg, 20.0, true, false, true) {
+        // Apex refine (default): use_apex = true, so no averaged composite is built.
+        if let Some(r) = refine_feature_shift(f, scans, avg, 20.0, true, false, false) {
             n_gain += 1;
             let pk = f
                 .peaks
