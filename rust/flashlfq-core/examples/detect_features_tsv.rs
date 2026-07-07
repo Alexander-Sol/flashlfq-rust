@@ -663,6 +663,27 @@ fn main() {
     timings.push(("write resolved".into(), write_dur.as_secs_f64()));
     eprintln!("wrote {} -> {}", resolved.len(), out_path);
 
+    // MSALIGN_OUT=1: also emit the resolved features as an MS1 TopFD/msDeconv `.msalign`
+    // (readable by mzLib's Ms1Align reader). Opt-in; the TSV outputs above are unchanged.
+    if std::env::var("MSALIGN_OUT").is_ok() {
+        let msalign_path = match out_path.strip_suffix(".tsv") {
+            Some(stem) => format!("{stem}.ms1.msalign"),
+            None => format!("{out_path}.ms1.msalign"),
+        };
+        let src = std::path::Path::new(spectra_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(spectra_path);
+        let feats = flashlfq_core::feature_export::resolved_to_ms1align_features(&resolved);
+        match flashlfq_core::feature_export::write_ms1_align_file(&msalign_path, &feats, src) {
+            Ok(()) => eprintln!(
+                "  MSALIGN_OUT: wrote {} MS1 features -> {msalign_path}",
+                feats.len()
+            ),
+            Err(e) => eprintln!("  WARN: could not write msalign {msalign_path}: {e}"),
+        }
+    }
+
     if let Some(ref_path) = reference_path {
         let t5 = Instant::now();
         compare_to_reference(ref_path, &resolved);

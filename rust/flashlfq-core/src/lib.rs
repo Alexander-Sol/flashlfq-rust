@@ -12,6 +12,7 @@ pub mod chromatographic_peak;
 pub mod deconvolution;
 pub mod detection_type;
 pub mod engine;
+pub mod feature_export;
 pub mod feature_refinement;
 pub mod isotope_shift_decon;
 pub mod isotopic_distribution;
