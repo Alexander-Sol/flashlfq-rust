@@ -1,0 +1,145 @@
+output files:
+  detected (pre-refinement): F:\flashlfq-rust\analysis\longer_gradients\long_features.detected.tsv
+  refined (post-decon):      F:\flashlfq-rust\analysis\longer_gradients\long_features.refined.tsv
+  resolved (final):          F:\flashlfq-rust\analysis\longer_gradients\long_features.tsv
+  timing log:                F:\flashlfq-rust\analysis\longer_gradients\long_features.log
+reading MS1 scans from D:\PXD003881_IonStar_SpikeIn\B03_19_150304_human_ecoli_B_3ul_3um_column_95_HCD_OT_2hrs_30B_9B.raw ...
+  10582 MS1 scans, 22528910 peaks, ΣTIC 2.300e13, median scan spacing 0.0124 min  (28.5s)
+score model: RawSum  (η = 0.0 @ p5, A = least-squares, template-norm)
+σ source: data-driven (measured FWHM via XIC half-max; fallback 36 s) → 17.66 s FWHM
+comb weight model: Averagine
+detecting (charge 1..=6, 10 ppm, σ_rt 0.1250 min, ±20 scans, trace: 1 missed / 30 s half-width, min 2 scans, seed floor 1000, coverage 90%) ...
+  [DETECT_PROFILE] total 47.84s | seed_prep(all_peaks+sort) 2.30s | rt_window 0.18s | score_hypothesis 36.65s | trace_claim 5.70s | other 3.01s
+  [DETECT_PROFILE] seeds_considered(unclaimed) 121663 | score_hypothesis calls 729978 | features 114732
+  114732 features detected, explained 90.0% of ΣTIC  (48.0s)
+  wrote 114732 detected features -> F:\flashlfq-rust\analysis\longer_gradients\long_features.detected.tsv
+  refine method: shift_apex + recharge (envelope-fit cosine)
+    refined 1000/114732 (1000 kept)  [34.7209ms]
+    refined 2000/114732 (2000 kept)  [59.4755ms]
+    refined 3000/114732 (3000 kept)  [84.0599ms]
+    refined 4000/114732 (4000 kept)  [127.1234ms]
+    refined 5000/114732 (5000 kept)  [151.7899ms]
+    refined 6000/114732 (6000 kept)  [198.0641ms]
+    refined 7000/114732 (7000 kept)  [249.3313ms]
+    refined 8000/114732 (8000 kept)  [280.4561ms]
+    refined 9000/114732 (9000 kept)  [303.1611ms]
+    refined 10000/114732 (10000 kept)  [325.9008ms]
+    refined 11000/114732 (11000 kept)  [348.935ms]
+    refined 12000/114732 (12000 kept)  [372.1102ms]
+    refined 13000/114732 (13000 kept)  [394.4344ms]
+    refined 14000/114732 (14000 kept)  [416.3218ms]
+    refined 15000/114732 (15000 kept)  [439.7673ms]
+    refined 16000/114732 (16000 kept)  [485.866ms]
+    refined 17000/114732 (17000 kept)  [514.3628ms]
+    refined 18000/114732 (18000 kept)  [536.4958ms]
+    refined 19000/114732 (19000 kept)  [559.5936ms]
+    refined 20000/114732 (20000 kept)  [585.9835ms]
+    refined 21000/114732 (21000 kept)  [608.1127ms]
+    refined 22000/114732 (22000 kept)  [629.1238ms]
+    refined 23000/114732 (23000 kept)  [651.6401ms]
+    refined 24000/114732 (24000 kept)  [696.6783ms]
+    refined 25000/114732 (25000 kept)  [721.3266ms]
+    refined 26000/114732 (26000 kept)  [743.2698ms]
+    refined 27000/114732 (27000 kept)  [766.5856ms]
+    refined 28000/114732 (28000 kept)  [788.1858ms]
+    refined 29000/114732 (29000 kept)  [810.3921ms]
+    refined 30000/114732 (30000 kept)  [832.8563ms]
+    refined 31000/114732 (31000 kept)  [853.6899ms]
+    refined 32000/114732 (32000 kept)  [876.846ms]
+    refined 33000/114732 (33000 kept)  [899.9243ms]
+    refined 34000/114732 (34000 kept)  [922.375ms]
+    refined 35000/114732 (35000 kept)  [943.7097ms]
+    refined 36000/114732 (36000 kept)  [970.5461ms]
+    refined 37000/114732 (37000 kept)  [1.0110984s]
+    refined 38000/114732 (38000 kept)  [1.0352128s]
+    refined 39000/114732 (39000 kept)  [1.0583426s]
+    refined 40000/114732 (40000 kept)  [1.080031s]
+    refined 41000/114732 (41000 kept)  [1.1016943s]
+    refined 42000/114732 (42000 kept)  [1.123841s]
+    refined 43000/114732 (43000 kept)  [1.1469218s]
+    refined 44000/114732 (44000 kept)  [1.1710373s]
+    refined 45000/114732 (45000 kept)  [1.2285712s]
+    refined 46000/114732 (46000 kept)  [1.2628665s]
+    refined 47000/114732 (47000 kept)  [1.2848478s]
+    refined 48000/114732 (48000 kept)  [1.3175044s]
+    refined 49000/114732 (49000 kept)  [1.3475235s]
+    refined 50000/114732 (50000 kept)  [1.3804804s]
+    refined 51000/114732 (51000 kept)  [1.4034773s]
+    refined 52000/114732 (52000 kept)  [1.4256773s]
+    refined 53000/114732 (53000 kept)  [1.447536s]
+    refined 54000/114732 (54000 kept)  [1.4727468s]
+    refined 55000/114732 (55000 kept)  [1.4950517s]
+    refined 56000/114732 (56000 kept)  [1.5175855s]
+    refined 57000/114732 (57000 kept)  [1.5395648s]
+    refined 58000/114732 (58000 kept)  [1.5649132s]
+    refined 59000/114732 (59000 kept)  [1.6102098s]
+    refined 60000/114732 (60000 kept)  [1.6332625s]
+    refined 61000/114732 (61000 kept)  [1.665884s]
+    refined 62000/114732 (62000 kept)  [1.6900236s]
+    refined 63000/114732 (63000 kept)  [1.7143631s]
+    refined 64000/114732 (64000 kept)  [1.7367838s]
+    refined 65000/114732 (65000 kept)  [1.7585133s]
+    refined 66000/114732 (66000 kept)  [1.782581s]
+    refined 67000/114732 (67000 kept)  [1.8053497s]
+    refined 68000/114732 (68000 kept)  [1.8331414s]
+    refined 69000/114732 (69000 kept)  [1.856478s]
+    refined 70000/114732 (70000 kept)  [1.8866286s]
+    refined 71000/114732 (71000 kept)  [1.9088337s]
+    refined 72000/114732 (72000 kept)  [1.9327062s]
+    refined 73000/114732 (73000 kept)  [1.9596785s]
+    refined 74000/114732 (74000 kept)  [1.984883s]
+    refined 75000/114732 (75000 kept)  [2.0243228s]
+    refined 76000/114732 (76000 kept)  [2.0680078s]
+    refined 77000/114732 (77000 kept)  [2.1093247s]
+    refined 78000/114732 (78000 kept)  [2.1501506s]
+    refined 79000/114732 (79000 kept)  [2.1721087s]
+    refined 80000/114732 (80000 kept)  [2.1943922s]
+    refined 81000/114732 (81000 kept)  [2.2374662s]
+    refined 82000/114732 (82000 kept)  [2.2647548s]
+    refined 83000/114732 (83000 kept)  [2.2882046s]
+    refined 84000/114732 (84000 kept)  [2.3109213s]
+    refined 85000/114732 (85000 kept)  [2.3335897s]
+    refined 86000/114732 (86000 kept)  [2.3540035s]
+    refined 87000/114732 (87000 kept)  [2.3896535s]
+    refined 88000/114732 (88000 kept)  [2.4305448s]
+    refined 89000/114732 (89000 kept)  [3.5757639s]
+    refined 90000/114732 (90000 kept)  [3.6136767s]
+    refined 91000/114732 (91000 kept)  [3.6562814s]
+    refined 92000/114732 (92000 kept)  [3.6970947s]
+    refined 93000/114732 (93000 kept)  [3.7197023s]
+    refined 94000/114732 (94000 kept)  [3.7426467s]
+    refined 95000/114732 (95000 kept)  [3.7628828s]
+    refined 96000/114732 (96000 kept)  [3.7846376s]
+    refined 97000/114732 (97000 kept)  [3.8075547s]
+    refined 98000/114732 (98000 kept)  [3.8521096s]
+    refined 99000/114732 (99000 kept)  [3.877943s]
+    refined 100000/114732 (100000 kept)  [3.8995585s]
+    refined 101000/114732 (101000 kept)  [3.9211091s]
+    refined 102000/114732 (102000 kept)  [3.9452193s]
+    refined 103000/114732 (103000 kept)  [3.9687303s]
+    refined 104000/114732 (104000 kept)  [3.9927749s]
+    refined 105000/114732 (105000 kept)  [4.0167568s]
+    refined 106000/114732 (106000 kept)  [4.0400677s]
+    refined 107000/114732 (107000 kept)  [4.0636313s]
+    refined 108000/114732 (108000 kept)  [4.0856923s]
+    refined 109000/114732 (109000 kept)  [4.1072594s]
+    refined 110000/114732 (110000 kept)  [4.1284698s]
+    refined 111000/114732 (111000 kept)  [4.1509332s]
+    refined 112000/114732 (112000 kept)  [4.1717016s]
+    refined 113000/114732 (113000 kept)  [4.2162963s]
+    refined 114000/114732 (114000 kept)  [4.2453064s]
+    refined 114732/114732 (114732 kept)  [4.265941s]
+  114732 / 114732 features refined against averaged composites  (4.3s)
+  wrote 114732 refined features -> F:\flashlfq-rust\analysis\longer_gradients\long_features.refined.tsv
+  96058 peptide-level features after charge-state consensus  (268.8ms)
+wrote 96058 -> F:\flashlfq-rust\analysis\longer_gradients\long_features.tsv
+=== timing summary ===
+spectra file: D:\PXD003881_IonStar_SpikeIn\B03_19_150304_human_ecoli_B_3ul_3um_column_95_HCD_OT_2hrs_30B_9B.raw
+10582 MS1 scans, 22528910 peaks, 114732 detected, 114732 refined, 96058 resolved features
+  read + index                28.50 s  (33.4%)
+  detect                      47.95 s  (56.2%)
+  refine                       4.27 s  ( 5.0%)
+  charge-state consensus       0.27 s  ( 0.3%)
+  write resolved               0.55 s  ( 0.6%)
+  TOTAL                       85.32 s
+timing log appended to F:\flashlfq-rust\analysis\longer_gradients\long_features.log
