@@ -305,10 +305,13 @@ fn main() {
         _ => CombWeightModel::Averagine,
     };
     // Coverage target (fraction of ΣTIC to explain) selectable via COVERAGE_TARGET=0.80|0.90|0.99…
+    // Default 1.0 (uncapped): the detector runs to the seed-intensity floor. This is also what keeps the
+    // default 2-D tiling path engaged — any coverage target < 1.0 needs a global running ΣTIC and forces
+    // the serial fallback (see detect_features). Set COVERAGE_TARGET < 1 to cap coverage on the serial path.
     let coverage_target = std::env::var("COVERAGE_TARGET")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.90);
+        .unwrap_or(1.0);
     // Assumed chromatographic FWHM (seconds) that sets the RT Gaussian σ and matched-filter window,
     // selectable via ASSUMED_FWHM_SEC (default 36). Real CA/Lumos peaks are ~3-20 s wide, so smaller
     // values narrow the window to the data and reduce broad-hypothesis interference.

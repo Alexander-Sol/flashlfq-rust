@@ -1081,48 +1081,41 @@ enum SeedOutcome {
 
 /// Runs the untargeted MS1 detector.
 ///
-/// Single-threaded and greedy (tallest-first, claim-as-you-go) by default — that path is
-/// [`detect_features_serial`] and its output is the reference. Setting the env var
-/// **`DETECT_PARALLEL`** switches to the intra-file red-black RT-binning path
-/// ([`detect_features_parallel`]): the file is cut into equal-work RT bins (each ≥ 4 min wide),
-/// even-indexed bins are detected in parallel, then odd-indexed bins in parallel, so no two
-/// concurrently-processed bins can claim the same peaks. That path is **not** bit-identical to the
-/// serial greedy — features straddling a bin boundary can be claimed by the earlier phase regardless
-/// of global intensity order — so it is opt-in and disabled whenever a *global* stopping heuristic
-/// (coverage target < 1, knee stop) is engaged, since those need a global ΣTIC and do not compose with
-/// binning. The **reject-rate** stop is the exception — being self-referential it is applied per bin/tile
-/// (see [`detect_bin`] / [`tile_reject_cfg`]), so a reject-capped run stays on the parallel path.
+/// **Defaults to the intra-file 2-D m/z×RT tiling path** ([`detect_features_tile2d`]): the file is cut
+/// into a 4-coloured grid of m/z×RT tiles detected in parallel (rayon), with per-tile seed re-anchoring so
+/// an isotope tooth split across an m/z border cannot mis-anchor. Env overrides:
+/// - **`DETECT_SERIAL`** — force the single-threaded greedy reference ([`detect_features_serial`]): the
+///   tallest-first, claim-as-you-go path the tiling detector is validated bit-against.
+/// - **`DETECT_PARALLEL`** — use the 1-D red-black RT-binning path ([`detect_features_parallel`]) instead
+///   of the 2-D grid.
+///
+/// Neither parallel path is bit-identical to serial — a feature straddling a tile/bin boundary can be
+/// claimed by the earlier phase regardless of global intensity order — so both are **automatically
+/// disabled (→ serial) whenever a *global* stopping heuristic (coverage target < 1, knee stop) is
+/// engaged**, since those need a global running ΣTIC that cannot be evaluated inside one independent
+/// tile/bin. The **reject-rate** stop is the exception — being self-referential it is applied per
+/// tile/bin (see [`detect_bin`] / [`tile_reject_cfg`]), so a reject-capped run stays parallel. A tiny
+/// input that cannot be split (too few scans / too narrow an m/z range) also falls back to serial.
 pub fn detect_features(
     engine: &PeakIndexingEngine,
     params: &TraceKernelParameters,
 ) -> Vec<DetectedFeature> {
-    let tile2d_requested = std::env::var("DETECT_TILE2D").is_ok();
-    let parallel_requested = std::env::var("DETECT_PARALLEL").is_ok();
-    // The coverage target and knee stops need a *global* running ΣTIC, so they cannot be evaluated inside
-    // an independent tile and force the serial path. The reject-rate stop is deliberately NOT here: it is
-    // self-referential (a tile's own scored-seed reject fraction) and is instead applied per-tile inside
-    // [`detect_bin`] via [`tile_reject_cfg`], so a reject-capped run stays parallel.
+    // 2-D tiling is the default; DETECT_SERIAL forces the reference path, DETECT_PARALLEL selects the 1-D
+    // RT-binning path. The coverage target and knee stops need a *global* running ΣTIC, so they cannot be
+    // evaluated inside an independent tile/bin and force serial. The reject-rate stop is deliberately NOT
+    // one of these — it is self-referential and applied per tile inside [`detect_bin`] via
+    // [`tile_reject_cfg`], so a reject-capped run stays parallel.
+    let force_serial = std::env::var("DETECT_SERIAL").is_ok();
+    let parallel_1d_requested = std::env::var("DETECT_PARALLEL").is_ok();
     let global_stop_engaged = params.coverage_target < 1.0 || params.knee_stop_enabled;
-    // The 2-D m/z×RT tiling path takes precedence over the 1-D RT-binning path when both are set.
-    if tile2d_requested {
-        if global_stop_engaged {
-            eprintln!(
-                "[DETECT_TILE2D] ignored: a global-stop heuristic (coverage target < 1, or knee) is \
-                 engaged, which does not compose with 2-D tiling — using the serial path. (The \
-                 reject-rate stop DOES compose and is applied per tile.)"
-            );
-        } else if let Some(features) = detect_features_tile2d(engine, params) {
-            return features;
-        }
-    }
-    if parallel_requested {
-        if global_stop_engaged {
-            eprintln!(
-                "[DETECT_PARALLEL] ignored: a global-stop heuristic (coverage target < 1, or knee) is \
-                 engaged, which does not compose with RT binning — using the serial path. (The \
-                 reject-rate stop DOES compose and is applied per bin.)"
-            );
-        } else if let Some(features) = detect_features_parallel(engine, params) {
+
+    if !force_serial && !global_stop_engaged {
+        let parallel = if parallel_1d_requested {
+            detect_features_parallel(engine, params)
+        } else {
+            detect_features_tile2d(engine, params)
+        };
+        if let Some(features) = parallel {
             return features;
         }
     }
@@ -1686,8 +1679,8 @@ fn tile_color(i_rt: usize, i_mz: usize) -> u8 {
     (((i_rt & 1) << 1) | (i_mz & 1)) as u8
 }
 
-/// Intra-file **2-D m/z×RT tiling** detector (opt-in, env `DETECT_TILE2D`; see [`detect_features`] and
-/// `agent_info/Detector-2D-Tiling-Spec.md`). Generalises the 1-D red-black RT path
+/// Intra-file **2-D m/z×RT tiling** detector (the **default** path — see [`detect_features`]; opt out with
+/// `DETECT_SERIAL` — and `agent_info/Detector-2D-Tiling-Spec.md`). Generalises the 1-D red-black RT path
 /// ([`detect_features_parallel`]) to a 2-D grid 4-coloured so non-adjacent tiles run concurrently.
 /// Returns `None` (caller falls back to serial) when the run is too short/narrow to yield ≥ 2
 /// margin-respecting tiles on each axis.
