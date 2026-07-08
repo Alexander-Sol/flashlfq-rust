@@ -41,6 +41,8 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use rayon::prelude::*;
+
 use crate::isotopic_envelope::{C13_MINUS_C12, PROTON_MASS};
 use crate::peak_indexing::{IndexedMassSpectralPeak, PeakIndexingEngine, PeakKey, ScanInfo};
 use crate::tolerance::PpmTolerance;
@@ -169,6 +171,17 @@ pub struct TraceKernelParameters {
     /// Absolute floor on the rolling slope (fraction of ΣTIC per seed) below which the tail is flat
     /// enough to stop regardless of the relative test.
     pub knee_abs_eps: f64,
+    /// **Opt-in, default `false`.** Auto-stop the seed walk once the rolling fraction of *considered*
+    /// (scored) seeds that get rejected exceeds [`Self::reject_stop_frac`]. Unlike the TIC knee this
+    /// keys on the detector's own hit-rate — a self-referential, machine/sample-portable signal — and
+    /// fires where the tail turns mostly to noise (persistence-rejected single-scan spikes). A
+    /// speed/recall knob, not a correctness fix.
+    pub reject_stop_enabled: bool,
+    /// Width (in scored seeds) of the rolling window over which the reject fraction is measured.
+    pub reject_stop_window: usize,
+    /// Stop when the window's reject fraction reaches this value (e.g. `0.50` = half of considered
+    /// seeds being discarded).
+    pub reject_stop_frac: f64,
 }
 
 impl Default for TraceKernelParameters {
@@ -200,6 +213,9 @@ impl Default for TraceKernelParameters {
             knee_window_seeds: 20_000,
             knee_slope_frac: 0.02,
             knee_abs_eps: 1e-7,
+            reject_stop_enabled: false,
+            reject_stop_window: 20_000,
+            reject_stop_frac: 0.50,
         }
     }
 }
@@ -717,41 +733,28 @@ pub fn estimate_noise_floor(engine: &PeakIndexingEngine, percentile: f64) -> f64
 /// wider than 2σ is claimed whole, so its smaller adjacent seeds are already claimed and never fire —
 /// fragmentation never forms, and there is nothing to merge downstream.
 ///
-/// Two steps:
-/// 1. **Extent.** Follow the most-abundant tooth (the seed's m/z — highest SNR, most reliable
-///    boundary) outward in RT with [`PeakIndexingEngine::get_xic_by_scan_index`], stopping on
-///    `trace_missed_scans_allowed` consecutive misses or the `trace_max_half_width_minutes` guard.
-///    Its peaks' scan indices give the extent `[s_lo, s_hi]`. Peaks already in `claimed` count as
-///    misses (a taller neighbour claimed them first), which is what splits co-eluting same-m/z peaks
-///    greedily instead of merging them.
-/// 2. **Gather.** Collect every comb tooth's peak at each scan in `[s_lo, s_hi]`, excluding anything
-///    already `claimed`. The union (deduped) is the feature's peak set — the single set that backs its
-///    RT bounds, summed intensity, coverage contribution, and the NMS claim mask alike.
-fn trace_claim_extent(
+/// Two steps, split so step 1 can run **before** charge scoring as a cheap persistence pre-gate:
+/// 1. [`trace_seed_extent`] — follow the most-abundant tooth (the seed's m/z) to fix `[s_lo, s_hi]`.
+/// 2. [`gather_extent_peaks`] — collect every comb tooth's peaks across that extent.
+///
+/// **Step 1: extent.** Follow the most-abundant tooth (the seed's m/z — highest SNR, most reliable
+/// boundary) outward in RT with [`PeakIndexingEngine::get_xic_by_scan_index`], stopping on
+/// `trace_missed_scans_allowed` consecutive misses or the `trace_max_half_width_minutes` guard. Its
+/// peaks' scan indices give the extent `[s_lo, s_hi]`. Peaks already in `claimed` count as misses (a
+/// taller neighbour claimed them first), which is what splits co-eluting same-m/z peaks greedily
+/// instead of merging them. Charge-independent (uses only the seed m/z), so it is safe to run before
+/// scoring: a seed whose own XIC spans too few scans is a single-scan noise spike and can be retired
+/// without paying for the (six-charge) envelope scoring — that is where most of the tail's wasted
+/// compute goes (the persistence gate, not the envelope gate, rejects the bulk of low-abundance seeds).
+fn trace_seed_extent(
     engine: &PeakIndexingEngine,
     seed: &IndexedMassSpectralPeak,
-    hyp: &HypothesisScore,
     params: &TraceKernelParameters,
     ppm: &PpmTolerance,
     claimed: &HashSet<PeakKey>,
-) -> Vec<IndexedMassSpectralPeak> {
-    let charge = hyp.charge;
+) -> (i32, i32) {
     let seed_mz = seed.m() as f64;
-    let weights = comb_weights(mz_to_mass(seed_mz, charge), params);
-    if weights.is_empty() {
-        // Degenerate comb — nothing to trace; claim the scored peaks (minus any already claimed).
-        return hyp
-            .peaks
-            .iter()
-            .filter(|p| !claimed.contains(&p.key()))
-            .copied()
-            .collect();
-    }
-    let spacing = C13_MINUS_C12 / charge as f64;
-    let mono_mz = hyp.mono_mz;
     let apex_scan = seed.zero_based_scan_index;
-
-    // 1) Extent: follow the most-abundant tooth to fix the scan span.
     let trace = engine.get_xic_by_scan_index(
         seed_mz,
         apex_scan,
@@ -766,9 +769,39 @@ fn trace_claim_extent(
         s_lo = s_lo.min(p.zero_based_scan_index);
         s_hi = s_hi.max(p.zero_based_scan_index);
     }
+    (s_lo, s_hi)
+}
 
-    // 2) Gather every comb tooth's peaks across the extent, skipping already-claimed peaks and
-    //    de-duplicating (adjacent teeth of a high charge can resolve to the same physical peak).
+/// **Step 2: gather.** Collect every comb tooth's peak at each scan in `[s_lo, s_hi]`, excluding
+/// anything already `claimed`. The union (deduped) is the feature's peak set — the single set that
+/// backs its RT bounds, summed intensity, coverage contribution, and the NMS claim mask alike. Needs
+/// the accepted hypothesis (charge + monoisotopic m/z), so it runs after scoring; the extent it walks
+/// is the one [`trace_seed_extent`] already fixed (no second XIC walk).
+fn gather_extent_peaks(
+    engine: &PeakIndexingEngine,
+    seed: &IndexedMassSpectralPeak,
+    hyp: &HypothesisScore,
+    s_lo: i32,
+    s_hi: i32,
+    params: &TraceKernelParameters,
+    ppm: &PpmTolerance,
+    claimed: &HashSet<PeakKey>,
+) -> Vec<IndexedMassSpectralPeak> {
+    let charge = hyp.charge;
+    let seed_mz = seed.m() as f64;
+    let weights = comb_weights(mz_to_mass(seed_mz, charge), params);
+    if weights.is_empty() {
+        // Degenerate comb — nothing to gather; claim the scored peaks (minus any already claimed).
+        return hyp
+            .peaks
+            .iter()
+            .filter(|p| !claimed.contains(&p.key()))
+            .copied()
+            .collect();
+    }
+    let spacing = C13_MINUS_C12 / charge as f64;
+    let mono_mz = hyp.mono_mz;
+
     let mut seen: HashSet<PeakKey> = HashSet::new();
     let mut peaks: Vec<IndexedMassSpectralPeak> = Vec::new();
     for k in 0..weights.len() {
@@ -797,6 +830,20 @@ fn trace_claim_extent(
     peaks
 }
 
+/// Running tally of what happens to each *scored* seed (one that was unclaimed and reached charge
+/// scoring — claimed seeds are skipped before this and never counted). `scored == accepted +
+/// rej_env + rej_pers`. Reported in the progress line so the seed-rejection rate (fraction of
+/// considered seeds that fail to yield a viable envelope) can be plotted vs progress.
+#[derive(Clone, Copy, Default)]
+struct SeedTally {
+    /// Unclaimed seeds that reached charge scoring (the denominator of "considered").
+    scored: u64,
+    /// Rejected: no viable envelope (too few isotopes observed, or non-positive response).
+    rej_env: u64,
+    /// Rejected: had an envelope but its traced extent failed the persistence gate.
+    rej_pers: u64,
+}
+
 /// Opt-in live progress reporter for the detect loop (env `DETECT_PROGRESS`). Loop-local and
 /// non-`Sync`: constructed once before the serial acceptance walk, mutated only from that walk.
 ///
@@ -818,7 +865,7 @@ struct DetectProgress {
 impl DetectProgress {
     /// Throttled emit. Ordered cheapest-check-first so the common (no-emit) path is a single
     /// integer subtraction+compare and never calls `Instant::now()` or allocates.
-    fn maybe_emit(&mut self, seeds_considered: u64, accepted: usize, explained: f64) {
+    fn maybe_emit(&mut self, seeds_considered: u64, accepted: usize, explained: f64, seed_intensity: f64, tally: SeedTally) {
         if !self.enabled {
             return;
         }
@@ -831,17 +878,22 @@ impl DetectProgress {
         }
         self.last_emit_seeds = seeds_considered;
         self.last_emit_time = now;
-        self.emit(seeds_considered, accepted, explained);
+        self.emit(seeds_considered, accepted, explained, seed_intensity, tally);
     }
 
     /// Unconditional emit (used for the final line at loop exit); still gated on `enabled`.
-    fn final_emit(&self, seeds_considered: u64, accepted: usize, explained: f64) {
+    fn final_emit(&self, seeds_considered: u64, accepted: usize, explained: f64, seed_intensity: f64, tally: SeedTally) {
         if self.enabled {
-            self.emit(seeds_considered, accepted, explained);
+            self.emit(seeds_considered, accepted, explained, seed_intensity, tally);
         }
     }
 
-    fn emit(&self, seeds_considered: u64, accepted: usize, explained: f64) {
+    /// `seed_intensity` is the intensity of the seed being processed at this emit. Because seeds are
+    /// visited intensity-descending, it is the effective *seed-intensity floor* reached so far — i.e.
+    /// every peak still unclaimed below it is untouched. This is the physical quantity a S/N-based
+    /// auto-stop keys on, and lets a coverage %ΣTIC be mapped to the seed intensity that produced it.
+    /// `tally` carries the cumulative scored/rejected seed counts for the rejection-rate curve.
+    fn emit(&self, seeds_considered: u64, accepted: usize, explained: f64, seed_intensity: f64, tally: SeedTally) {
         let pool_total = self.pool_total as u64;
         let pool_remaining = pool_total.saturating_sub(seeds_considered.min(pool_total));
         let pct = if self.total_tic > 0.0 {
@@ -851,11 +903,16 @@ impl DetectProgress {
         };
         eprintln!(
             "[DETECT_PROGRESS] seeds {}/{} (pool_remaining {}) | accepted {} | \
+             seed_int {:.0} | scored {} | rej_env {} | rej_pers {} | \
              TIC {:.2e} ({:.1}% of ΣTIC) | {:.1}s",
             seeds_considered,
             pool_total,
             pool_remaining,
             accepted,
+            seed_intensity,
+            tally.scored,
+            tally.rej_env,
+            tally.rej_pers,
             explained,
             pct,
             self.start_time.elapsed().as_secs_f64(),
@@ -918,7 +975,86 @@ impl KneeDetector {
     }
 }
 
+/// Opt-in auto-stop keyed on the detector's *seed-rejection rate* (params `reject_stop_enabled`;
+/// driver env `DETECT_REJECT_STOP`). Loop-local, O(1) state. Fires once the rolling fraction of
+/// considered (scored) seeds being rejected — no persistent envelope — reaches `frac` over a window
+/// of `window` scored seeds. Because seeds are visited tallest-first this fraction rises
+/// monotonically, so a single rolling window (no reference/warmup) captures the crossing; unlike the
+/// TIC knee it needs no ΣTIC normalisation and is self-referential (portable across files/instruments).
+struct RejectStop {
+    enabled: bool,
+    window: u64,
+    frac: f64,
+    win_start_scored: u64,
+    win_start_rejected: u64,
+    /// Reject fraction of the last completed window (for the stop-line log).
+    last_rate: f64,
+}
+
+impl RejectStop {
+    /// Feed the running cumulative (scored, rejected) counts. Returns `true` when the most recent full
+    /// window's reject fraction reached `frac`. A no-op returning `false` when disabled.
+    fn observe(&mut self, scored: u64, rejected: u64) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let dscored = scored.saturating_sub(self.win_start_scored);
+        if dscored < self.window {
+            return false;
+        }
+        let drej = rejected.saturating_sub(self.win_start_rejected);
+        let rate = drej as f64 / dscored as f64;
+        self.last_rate = rate;
+        self.win_start_scored = scored;
+        self.win_start_rejected = rejected;
+        rate >= self.frac
+    }
+}
+
+/// Runs the untargeted MS1 detector.
+///
+/// Single-threaded and greedy (tallest-first, claim-as-you-go) by default — that path is
+/// [`detect_features_serial`] and its output is the reference. Setting the env var
+/// **`DETECT_PARALLEL`** switches to the intra-file red-black RT-binning path
+/// ([`detect_features_parallel`]): the file is cut into equal-work RT bins (each ≥ 4 min wide),
+/// even-indexed bins are detected in parallel, then odd-indexed bins in parallel, so no two
+/// concurrently-processed bins can claim the same peaks. That path is **not** bit-identical to the
+/// serial greedy — features straddling a bin boundary can be claimed by the earlier phase regardless
+/// of global intensity order — so it is opt-in and disabled whenever a global-stopping heuristic
+/// (coverage target < 1, knee stop, reject stop) is engaged, since those do not compose with binning.
 pub fn detect_features(
+    engine: &PeakIndexingEngine,
+    params: &TraceKernelParameters,
+) -> Vec<DetectedFeature> {
+    let tile2d_requested = std::env::var("DETECT_TILE2D").is_ok();
+    let parallel_requested = std::env::var("DETECT_PARALLEL").is_ok();
+    let global_stop_engaged =
+        params.coverage_target < 1.0 || params.knee_stop_enabled || params.reject_stop_enabled;
+    // The 2-D m/z×RT tiling path takes precedence over the 1-D RT-binning path when both are set.
+    if tile2d_requested {
+        if global_stop_engaged {
+            eprintln!(
+                "[DETECT_TILE2D] ignored: a global-stop heuristic (coverage target < 1, knee, or \
+                 reject stop) is engaged, which does not compose with 2-D tiling — using the serial path."
+            );
+        } else if let Some(features) = detect_features_tile2d(engine, params) {
+            return features;
+        }
+    }
+    if parallel_requested {
+        if global_stop_engaged {
+            eprintln!(
+                "[DETECT_PARALLEL] ignored: a global-stop heuristic (coverage target < 1, knee, or \
+                 reject stop) is engaged, which does not compose with RT binning — using the serial path."
+            );
+        } else if let Some(features) = detect_features_parallel(engine, params) {
+            return features;
+        }
+    }
+    detect_features_serial(engine, params)
+}
+
+fn detect_features_serial(
     engine: &PeakIndexingEngine,
     params: &TraceKernelParameters,
 ) -> Vec<DetectedFeature> {
@@ -953,8 +1089,10 @@ pub fn detect_features(
     // a consumer engages — the coverage cap (`coverage_target < 1.0`), live progress reporting, OR
     // the knee auto-stop — so the common "detect everything, no progress" default still skips the
     // O(peaks) pass.
-    let need_total_tic =
-        params.coverage_target < 1.0 || progress_enabled || params.knee_stop_enabled;
+    let need_total_tic = params.coverage_target < 1.0
+        || progress_enabled
+        || params.knee_stop_enabled
+        || params.reject_stop_enabled;
     let total_intensity: f64 = if need_total_tic {
         seeds.iter().map(|p| p.intensity as f64).sum()
     } else {
@@ -991,11 +1129,27 @@ pub fn detect_features(
     };
     let knee_log = progress_enabled || params.knee_stop_enabled;
 
+    // Opt-in auto-stop at the seed-rejection-rate threshold (params `reject_stop_enabled`; default OFF).
+    let mut reject_stop = RejectStop {
+        enabled: params.reject_stop_enabled,
+        window: (params.reject_stop_window.max(1)) as u64,
+        frac: params.reject_stop_frac,
+        win_start_scored: 0,
+        win_start_rejected: 0,
+        last_rate: 0.0,
+    };
+    let reject_log = progress_enabled || params.reject_stop_enabled;
+
     let mut explained_intensity = 0.0;
 
     let mut claimed: HashSet<PeakKey> = HashSet::new();
     let mut features: Vec<DetectedFeature> = Vec::new();
     let mut seeds_visited: u64 = 0;
+    // Intensity of the most recent above-floor seed; == the effective seed-intensity floor at any
+    // loop-exit point (seeds are intensity-descending). Reported by the final progress line.
+    let mut last_seed_intensity: f64 = 0.0;
+    // Cumulative outcome tally over scored seeds (feeds the rejection-rate curve in the progress line).
+    let mut tally = SeedTally::default();
 
     for (seed_idx, seed) in seeds.iter().enumerate() {
         seeds_visited = seed_idx as u64 + 1;
@@ -1004,11 +1158,57 @@ pub fn detect_features(
         if (seed.intensity as f64) < params.min_seed_intensity {
             break;
         }
+        last_seed_intensity = seed.intensity as f64;
         if claimed.contains(&seed.key()) {
             continue;
         }
+
+        // Auto-stop once the rolling reject rate crosses the threshold (opt-in; checked before the
+        // current seed so it fires even during a long run of consecutive rejections). Uses the
+        // cumulative tally of already-completed seeds.
+        if reject_stop.observe(tally.scored, tally.rej_env + tally.rej_pers) {
+            if reject_log {
+                let pct = if total_intensity > 0.0 {
+                    100.0 * explained_intensity / total_intensity
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[DETECT_REJECT_STOP] stopping at seed {}/{} | scored {} | accepted {} | \
+                     window reject {:.1}% | {:.1}% of ΣTIC | {:.1}s",
+                    seed_idx as u64 + 1,
+                    seeds.len(),
+                    tally.scored,
+                    features.len(),
+                    100.0 * reject_stop.last_rate,
+                    pct,
+                    prof_t0.elapsed().as_secs_f64(),
+                );
+            }
+            break;
+        }
+
+        // Committed to considering this seed: it counts toward the rejection-rate curve.
+        tally.scored += 1;
         if profile {
             n_seed_considered += 1;
+        }
+
+        // Trace the most-abundant tooth (the seed's own m/z) FIRST, before any charge scoring. Its
+        // scan span is a cheap, charge-independent persistence pre-gate: a seed whose XIC spans fewer
+        // scans than `min_feature_scans` is a single-scan noise spike that the persistence gate would
+        // reject anyway (the gathered extent can span no more scans than this seed XIC), so retire it
+        // now and skip the six-charge envelope scoring. This front-loads the tail's dominant rejection
+        // (persistence, not envelope) ahead of its most expensive step.
+        let ts = if profile { Some(Instant::now()) } else { None };
+        let (s_lo, s_hi) = trace_seed_extent(engine, seed, params, &ppm, &claimed);
+        if let Some(ts) = ts {
+            t_trace += ts.elapsed().as_secs_f64();
+        }
+        if params.min_feature_scans > 1 && (s_hi - s_lo + 1) < params.min_feature_scans as i32 {
+            tally.rej_pers += 1;
+            claimed.insert(seed.key());
+            continue;
         }
 
         // The RT window (scan indices + Gaussian weights) is charge-independent — compute it once
@@ -1044,30 +1244,36 @@ pub fn detect_features(
 
         let best = match best {
             Some(b) => b,
-            None => continue,
+            None => {
+                tally.rej_env += 1;
+                continue;
+            }
         };
 
         if best.num_isotopes_observed < params.min_isotopes_observed || best.response <= 0.0 {
             // Not a feature; retire this seed so we do not reconsider it.
+            tally.rej_env += 1;
             claimed.insert(seed.key());
             continue;
         }
 
-        // Claim the feature's TRUE traced extent (not just the narrow scored window), so the whole
-        // elution is claimed at once and its smaller adjacent seeds cannot re-fire as fragments.
+        // Gather the feature's TRUE traced extent (not just the narrow scored window) over the span
+        // fixed above, so the whole elution is claimed at once and its smaller adjacent seeds cannot
+        // re-fire as fragments.
         let ts = if profile { Some(Instant::now()) } else { None };
-        let traced = trace_claim_extent(engine, seed, &best, params, &ppm, &claimed);
+        let traced = gather_extent_peaks(engine, seed, &best, s_lo, s_hi, params, &ppm, &claimed);
         if let Some(ts) = ts {
             t_trace += ts.elapsed().as_secs_f64();
         }
 
-        // Chromatographic-persistence gate: a real elution spans several scans; a feature whose
-        // traced extent covers fewer than `min_feature_scans` distinct scans is a single-scan noise
-        // doublet, not a peak. Retire the seed (as with the isotope-count gate) without emitting it.
+        // Full chromatographic-persistence gate: the pre-gate above bounds the *span*, but the gathered
+        // teeth can still cover fewer than `min_feature_scans` *distinct* scans if they are sparse
+        // within that span. Retire such a seed (as with the isotope-count gate) without emitting it.
         if params.min_feature_scans > 1 {
             let distinct_scans: HashSet<i32> =
                 traced.iter().map(|p| p.zero_based_scan_index).collect();
             if distinct_scans.len() < params.min_feature_scans {
+                tally.rej_pers += 1;
                 claimed.insert(seed.key());
                 continue;
             }
@@ -1081,7 +1287,7 @@ pub fn detect_features(
         features.push(feature);
 
         // Live progress (throttled, opt-in; no-op on the default path).
-        progress.maybe_emit(seed_idx as u64 + 1, features.len(), explained_intensity);
+        progress.maybe_emit(seed_idx as u64 + 1, features.len(), explained_intensity, seed.intensity as f64, tally);
 
         // Stop once we have explained the target fraction of the total MS1 signal.
         if explained_intensity >= coverage_stop {
@@ -1110,7 +1316,7 @@ pub fn detect_features(
     }
 
     // Final progress line at loop exit (regardless of throttle), so the last state is always logged.
-    progress.final_emit(seeds_visited, features.len(), explained_intensity);
+    progress.final_emit(seeds_visited, features.len(), explained_intensity, last_seed_intensity, tally);
 
     if profile {
         let total = prof_t0.elapsed().as_secs_f64();
@@ -1135,6 +1341,726 @@ pub fn detect_features(
     }
 
     features
+}
+
+/// Minimum RT width, in minutes, of a detector bin. Chosen well above `2 × reach` (the maximum RT
+/// distance any per-seed computation extends — see [`bin_reach_minutes`]) so that two bins processed
+/// concurrently in the same red-black phase — always separated by at least one full bin — can never
+/// claim the same peak. At the observed data-driven windows (tens of seconds) 4 min leaves a wide
+/// margin; do not lower it without re-deriving the separation guarantee.
+const DETECT_BIN_MIN_WIDTH_MINUTES: f64 = 4.0;
+
+/// Target m/z column width (daltons) for the 2-D tiling detector (§2). Deliberately **wide** — far
+/// above the strip-pad-derived floor — so only a small fraction of seeds sit near an m/z border and the
+/// re-anchoring halo scan (§6a) rarely fires; the RT axis supplies the bulk of the parallelism.
+/// Overridable via `DETECT_TILE2D_MZ_WIDTH` for tuning (raised to the strip-pad-derived floor if smaller).
+const DETECT_TILE_MZ_WIDTH_DALTONS: f64 = 96.0;
+
+/// Default m/z **re-anchoring reach** (thomson) for the 2-D tiling detector — the halo radius and the
+/// border-seed threshold (§6a). This is the *envelope span* in m/z: how far a minor isotope tooth can sit
+/// from its own envelope apex. Measured on the IonStar 2-hr gradient (1.1 M detections), the per-feature
+/// m/z reach `= observed_isotopes × (C13−C12)/z` is bounded in **thomson and shrinks with charge** (isotope
+/// count grows with mass but the `1.0033/z` spacing shrinks faster): z=1 is the worst case at ~3 Th median /
+/// 7 Th max, everything heavier is tighter. Overall p99 = 4.0 Th, p99.9 = 5.0 Th; only ~2 % of features
+/// exceed 4 Th and ~0.008 % exceed 6 Th. So **4 Th covers ~98 % of straddles directly**; the rare tail
+/// beyond is a mis-anchored bogus feature backstopped by the collision detector + fall-through (§6a residual
+/// edge), not a lost or double-claimed peak. Chosen over 6 Th because the halo scan cost grows ~radius²
+/// (scan width × border-seed fraction) — 6→4 Th cut detect time 16 % (10-min) / 6 % (2-hr) with <0.1 %
+/// feature change. Deliberately **smaller** than the theoretical claim bound
+/// (`max_isotopes × (C13−C12)/min_charge ≈ 12 Da`), which is used only for the strip pad / tile floor (§4).
+/// Overridable via `DETECT_TILE2D_REACH_MZ`.
+const DETECT_TILE_REACH_MZ_DALTONS: f64 = 4.0;
+
+/// The maximum RT half-width (minutes) any single seed's scoring or claim-trace reaches from its
+/// apex. A feature seeded in one bin can therefore touch peaks at most this far into an adjacent bin,
+/// and no further. The scoring window is `rt_half_window_minutes`; the claim-extent trace is capped
+/// at `trace_max_half_width_minutes`; the gathered extent never exceeds the trace. The bin width must
+/// exceed `2 ×` this for the within-phase no-collision guarantee to hold.
+fn bin_reach_minutes(params: &TraceKernelParameters) -> f64 {
+    params
+        .rt_half_window_minutes
+        .max(params.trace_max_half_width_minutes)
+}
+
+/// Intra-file red-black RT-binning detector (opt-in; see [`detect_features`]). Returns `None` when the
+/// run is too short to split into ≥ 2 bins, in which case the caller falls back to the serial path.
+///
+/// **Binning.** Seeds (all peaks) are partitioned into contiguous RT bins that are simultaneously
+/// *equal-work* (≈ equal seed count, the load-balancing target) and *≥ [`DETECT_BIN_MIN_WIDTH_MINUTES`]
+/// wide* (the correctness floor). A bin is closed only once both hold, so dense regions produce
+/// min-width bins and sparse regions widen until they carry a full share of seeds.
+///
+/// **Red-black scheduling.** Bins are 2-colored by index parity. Even bins are detected fully in
+/// parallel (phase 0), a barrier merges their claims, then odd bins are detected in parallel (phase 1)
+/// against those claims. Because every pair of same-color bins is separated by a full (≥ 4 min) bin and
+/// a seed reaches at most [`bin_reach_minutes`] (≪ 2 min) from its apex, concurrently-processed bins
+/// have disjoint claim sets — so each bin runs the ordinary serial [`detect_bin`] with its own
+/// `claimed` set and no locking on the hot path.
+///
+/// **Parity.** Not bit-identical to serial: at a bin boundary the even phase claims first regardless of
+/// which side holds the taller feature, so a small, boundary-localized set of features differ from the
+/// global tallest-first result. Everything away from a boundary is identical.
+fn detect_features_parallel(
+    engine: &PeakIndexingEngine,
+    params: &TraceKernelParameters,
+) -> Option<Vec<DetectedFeature>> {
+    let ppm = PpmTolerance::new(params.ppm_tolerance);
+    let profile = std::env::var("DETECT_PROFILE").is_ok();
+    let t0 = Instant::now();
+
+    let scan_info = engine.scan_info();
+    if scan_info.len() < 2 {
+        return None;
+    }
+    let rt_min = scan_info.first().unwrap().retention_time;
+    let rt_max = scan_info.last().unwrap().retention_time;
+    let rt_span = rt_max - rt_min;
+    if rt_span < 2.0 * DETECT_BIN_MIN_WIDTH_MINUTES {
+        return None; // too short to yield ≥ 2 min-width bins; not worth splitting
+    }
+
+    // Seeds ordered globally tallest-first, then re-grouped by bin. `all_peaks` mirrors the serial
+    // seed pool exactly.
+    let seeds = engine.all_peaks();
+    if seeds.is_empty() {
+        return Some(Vec::new());
+    }
+
+    // --- Build bin boundaries: equal-work with a hard min-width floor. -----------------------------
+    let threads = rayon::current_num_threads().max(1);
+    // Aim for a few bins per thread per phase so rayon can balance; more bins = finer balance, and the
+    // min-width floor caps how many actually fit. `2 × threads` per phase → `4 × threads` total target.
+    let target_bins = (((rt_span / DETECT_BIN_MIN_WIDTH_MINUTES).floor() as usize).max(2))
+        .min((4 * threads).max(2));
+    let target_work = seeds.len().div_ceil(target_bins).max(1);
+
+    // Boundaries are ascending RT cut points; a seed with `rt < cut` belongs to the lower bin. Built
+    // by walking seeds in RT order and closing a bin once it holds ≥ target_work seeds AND spans
+    // ≥ the min width.
+    let mut sorted_rts: Vec<f64> = seeds.iter().map(|p| p.retention_time as f64).collect();
+    sorted_rts.sort_by(f64::total_cmp);
+    let mut boundaries: Vec<f64> = Vec::new();
+    let mut count = 0usize;
+    let mut bin_start_rt = rt_min;
+    for &rt in &sorted_rts {
+        count += 1;
+        if count >= target_work && (rt - bin_start_rt) >= DETECT_BIN_MIN_WIDTH_MINUTES {
+            boundaries.push(rt);
+            bin_start_rt = rt;
+            count = 0;
+        }
+    }
+    drop(sorted_rts);
+    let n_bins = boundaries.len() + 1;
+    if n_bins < 2 {
+        return None;
+    }
+
+    // Bin index of an RT = number of boundaries at or below it.
+    let bin_of = |rt: f64| -> usize { boundaries.partition_point(|&b| b <= rt) };
+
+    // --- Group seeds by bin, tallest-first within each bin, without copying peaks. -----------------
+    // Sort an index permutation by (bin asc, intensity desc), then materialize one reordered peak
+    // Vec so each bin is a contiguous slice. `seeds` itself is dropped afterward, so peak memory
+    // matches the serial path (one seed pool resident).
+    let seed_bins: Vec<u32> = seeds
+        .iter()
+        .map(|p| bin_of(p.retention_time as f64) as u32)
+        .collect();
+    let mut order: Vec<u32> = (0..seeds.len() as u32).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (a as usize, b as usize);
+        seed_bins[a]
+            .cmp(&seed_bins[b])
+            .then_with(|| seeds[b].intensity.total_cmp(&seeds[a].intensity))
+    });
+    let ordered: Vec<IndexedMassSpectralPeak> =
+        order.iter().map(|&i| seeds[i as usize]).collect();
+    let ordered_bins: Vec<u32> = order.iter().map(|&i| seed_bins[i as usize]).collect();
+    drop(seeds);
+    drop(seed_bins);
+    drop(order);
+
+    // Contiguous [start, end) slice range for each bin in `ordered`.
+    let mut ranges: Vec<(usize, usize)> = vec![(0, 0); n_bins];
+    let mut start = 0usize;
+    for (b, range) in ranges.iter_mut().enumerate() {
+        let mut end = start;
+        while end < ordered.len() && ordered_bins[end] as usize == b {
+            end += 1;
+        }
+        *range = (start, end);
+        start = end;
+    }
+    drop(ordered_bins);
+
+    // Bin edges (n_bins + 1 RT points): [rt_min, boundaries.., rt_max⁺]. Bin b spans
+    // [bin_edges[b], bin_edges[b+1]). The final edge is nudged past rt_max so the last seed is inside.
+    let mut bin_edges: Vec<f64> = Vec::with_capacity(n_bins + 1);
+    bin_edges.push(rt_min);
+    bin_edges.extend_from_slice(&boundaries);
+    bin_edges.push(rt_max + 1.0);
+
+    let reach = bin_reach_minutes(params);
+
+    // --- Phase 0: even bins in parallel, each with a fresh (empty) claim set. ----------------------
+    let even_indices: Vec<usize> = (0..n_bins).step_by(2).collect();
+    let even_results: Vec<(usize, Vec<DetectedFeature>, Vec<IndexedMassSpectralPeak>)> = even_indices
+        .par_iter()
+        .map(|&b| {
+            let (lo, hi) = ranges[b];
+            let (features, claimed) =
+                detect_bin(engine, params, &ppm, &ordered[lo..hi], HashSet::new(), None);
+            (b, features, claimed)
+        })
+        .collect();
+
+    // Merge even-phase claims, sorted by RT, so each odd bin can be seeded from the thin boundary
+    // strip within `reach` of its span (all it can possibly observe from the earlier phase).
+    let mut even_claims: Vec<IndexedMassSpectralPeak> = even_results
+        .iter()
+        .flat_map(|(_, _, claimed)| claimed.iter().copied())
+        .collect();
+    even_claims.sort_by(|a, b| a.retention_time.total_cmp(&b.retention_time));
+    let claim_rts: Vec<f64> = even_claims.iter().map(|p| p.retention_time as f64).collect();
+
+    // --- Phase 1: odd bins in parallel, each pre-seeded with the even claims in its widened span. --
+    let odd_indices: Vec<usize> = (1..n_bins).step_by(2).collect();
+    let odd_results: Vec<(usize, Vec<DetectedFeature>)> = odd_indices
+        .par_iter()
+        .map(|&b| {
+            let lo_rt = bin_edges[b] - reach;
+            let hi_rt = bin_edges[b + 1] + reach;
+            let s = claim_rts.partition_point(|&r| r < lo_rt);
+            let e = claim_rts.partition_point(|&r| r <= hi_rt);
+            let seeded: HashSet<PeakKey> = even_claims[s..e].iter().map(|p| p.key()).collect();
+            let (lo, hi) = ranges[b];
+            let (features, _) = detect_bin(engine, params, &ppm, &ordered[lo..hi], seeded, None);
+            (b, features)
+        })
+        .collect();
+
+    // --- Reassemble in bin order (deterministic regardless of thread scheduling). ------------------
+    let mut per_bin: Vec<Vec<DetectedFeature>> = (0..n_bins).map(|_| Vec::new()).collect();
+    for (b, features, _) in even_results {
+        per_bin[b] = features;
+    }
+    for (b, features) in odd_results {
+        per_bin[b] = features;
+    }
+    let features: Vec<DetectedFeature> = per_bin.into_iter().flatten().collect();
+
+    if profile {
+        eprintln!(
+            "  [DETECT_PARALLEL] total {:.2}s | {} bins ({} even, {} odd) | {} threads | \
+             reach {:.2} min / min-width {:.1} min | features {}",
+            t0.elapsed().as_secs_f64(),
+            n_bins,
+            even_indices.len(),
+            odd_indices.len(),
+            threads,
+            reach,
+            DETECT_BIN_MIN_WIDTH_MINUTES,
+            features.len(),
+        );
+    }
+
+    Some(features)
+}
+
+/// The 4 colour of a tile from its grid coordinates: `(i_rt & 1, i_mz & 1)` packed as
+/// `((i_rt & 1) << 1) | (i_mz & 1)` ∈ 0..4. Same-colour tiles differ by ≥ 2 on at least one axis
+/// (§3), hence are separated by a full margin-respecting tile and can never claim the same peak.
+#[inline]
+fn tile_color(i_rt: usize, i_mz: usize) -> u8 {
+    (((i_rt & 1) << 1) | (i_mz & 1)) as u8
+}
+
+/// Intra-file **2-D m/z×RT tiling** detector (opt-in, env `DETECT_TILE2D`; see [`detect_features`] and
+/// `agent_info/Detector-2D-Tiling-Spec.md`). Generalises the 1-D red-black RT path
+/// ([`detect_features_parallel`]) to a 2-D grid 4-coloured so non-adjacent tiles run concurrently.
+/// Returns `None` (caller falls back to serial) when the run is too short/narrow to yield ≥ 2
+/// margin-respecting tiles on each axis.
+///
+/// **Why 2-D.** The RT claim reach grows with the trace cap (forcing coarse RT slices), but the m/z
+/// claim reach is fixed by the isotope model — so tiling the m/z axis keeps exposing independent
+/// regions exactly when RT slices go coarse.
+///
+/// **Grid.** RT bands are equal-work with a `2·reach_rt` (≥ 4 min) floor; m/z columns are fixed ~96-Da
+/// wide (§2). Every tile is validated ≥ `2·reach` on each axis so same-colour tiles are provably
+/// collision-free (§4).
+///
+/// **Schedule.** Colours `(i_rt&1, i_mz&1)` run in series 0→3; within a colour tiles run in parallel,
+/// each strip-seeded with the claims of its already-processed (earlier-colour) king-neighbours in the
+/// padded box (§5), then run through the ordinary serial [`detect_bin`] with seed re-anchoring (§6a).
+/// A per-colour barrier merges each tile's claims into a global set, and that merge *is* the collision
+/// detector (§6): a duplicate insert (impossible in nominal margin-respecting mode) is counted and the
+/// loser dropped. Features are reassembled in fixed (colour, tile) order — deterministic run-to-run.
+fn detect_features_tile2d(
+    engine: &PeakIndexingEngine,
+    params: &TraceKernelParameters,
+) -> Option<Vec<DetectedFeature>> {
+    let ppm = PpmTolerance::new(params.ppm_tolerance);
+    let profile = std::env::var("DETECT_PROFILE").is_ok();
+    let t0 = Instant::now();
+
+    let scan_info = engine.scan_info();
+    if scan_info.len() < 2 {
+        return None;
+    }
+    let rt_min = scan_info.first().unwrap().retention_time;
+    let rt_max = scan_info.last().unwrap().retention_time;
+    let rt_span = rt_max - rt_min;
+
+    // --- Reach on each axis (§1). ------------------------------------------------------------------
+    // Two distinct m/z quantities (decoupled for performance — the spec conflates them):
+    //  • `reach_mz` — the re-anchoring halo radius / border threshold (§6a). This is the envelope *span*
+    //    (how far a minor tooth sits from its apex), ~6 Da; a wider halo just costs more for no gain.
+    //  • `claim_reach_mz` — the theoretical bound on how far *any* seed's comb reaches from it:
+    //    `max_isotopes × (C13−C12)/min_charge` (~12 Da at z=1). This is what a claim can actually cross a
+    //    border by, so the strip pad and tile floor must be built from it (else a neighbour re-claims the
+    //    far tail of a long z=1 comb → a collision). RT reach grows with the trace cap; RT re-anchoring
+    //    stays on a single scan, so the RT reach is undoubled.
+    let reach_rt = bin_reach_minutes(params);
+    let claim_reach_mz =
+        params.max_isotopes as f64 * (C13_MINUS_C12 / params.min_charge.max(1) as f64);
+    let reach_mz = std::env::var("DETECT_TILE2D_REACH_MZ")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+        .unwrap_or(DETECT_TILE_REACH_MZ_DALTONS)
+        .min(claim_reach_mz);
+    // Worst-case m/z distance a claim reaches past a tile border: a re-anchored border seed finds its
+    // apex up to `reach_mz` across the border, and that apex's own comb reaches a further `claim_reach_mz`
+    // → `reach_mz + claim_reach_mz`. (An interior seed reaches only `claim_reach_mz`, which is smaller.)
+    // The strip pad must cover it so the neighbour strips those peaks; the column floor is `2×` the pad so
+    // two same-colour columns, separated by one intervening column, cannot both reach into its middle.
+    let strip_pad_mz = reach_mz + claim_reach_mz;
+    let min_axis_mz = 2.0 * strip_pad_mz;
+    let mz_width = std::env::var("DETECT_TILE2D_MZ_WIDTH")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v >= min_axis_mz)
+        .unwrap_or(DETECT_TILE_MZ_WIDTH_DALTONS.max(min_axis_mz));
+
+    let seeds = engine.all_peaks();
+    if seeds.is_empty() {
+        return Some(Vec::new());
+    }
+
+    // --- m/z columns: fixed-width, global cut points, thin trailing column merged into its neighbour.
+    let (mz_min, mz_max) = seeds.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+        let m = p.m() as f64;
+        (lo.min(m), hi.max(m))
+    });
+    let mut mz_edges: Vec<f64> = vec![mz_min];
+    let mut e = mz_min + mz_width;
+    while e < mz_max {
+        mz_edges.push(e);
+        e += mz_width;
+    }
+    mz_edges.push(mz_max + 1e-6); // nudge the final edge past the max so that seed lands in the last column
+    // Coarsen a too-thin trailing column (the remainder) until it clears the `min_axis_mz` floor.
+    while mz_edges.len() >= 3 {
+        let n = mz_edges.len();
+        if mz_edges[n - 1] - mz_edges[n - 2] < min_axis_mz {
+            mz_edges.remove(n - 2);
+        } else {
+            break;
+        }
+    }
+    let n_mz = mz_edges.len() - 1;
+    if n_mz < 2 {
+        if profile {
+            eprintln!(
+                "  [DETECT_TILE2D] fallback: m/z range {:.1}–{:.1} Da too narrow for ≥ 2 columns of {:.0} Da",
+                mz_min, mz_max, mz_width
+            );
+        }
+        return None; // too narrow for 2 m/z tiles — the 1-D path or serial covers this
+    }
+
+    // --- RT bands: equal-work with a `2·reach_rt` (≥ 4 min) floor (mirror the 1-D walk). ------------
+    let rt_floor = (2.0 * reach_rt).max(DETECT_BIN_MIN_WIDTH_MINUTES);
+    let max_rt_bands = (rt_span / rt_floor).floor() as usize;
+    if max_rt_bands < 2 {
+        if profile {
+            eprintln!(
+                "  [DETECT_TILE2D] fallback: RT span {:.1} min too short for ≥ 2 bands of {:.1} min",
+                rt_span, rt_floor
+            );
+        }
+        return None;
+    }
+    // Aim for ~2–4 tiles per thread per colour → ~12·threads total tiles; the m/z axis already fixes
+    // `n_mz` columns, so target the RT band count that hits the tile budget, clamped to what the floor
+    // allows.
+    let threads = rayon::current_num_threads().max(1);
+    let target_total = (3 * threads * 4).max(4);
+    let target_n_rt = (target_total / n_mz).clamp(2, max_rt_bands);
+    let target_work = seeds.len().div_ceil(target_n_rt).max(1);
+
+    let mut sorted_rts: Vec<f64> = seeds.iter().map(|p| p.retention_time as f64).collect();
+    sorted_rts.sort_by(f64::total_cmp);
+    let mut rt_cuts: Vec<f64> = Vec::new();
+    let mut count = 0usize;
+    let mut band_start_rt = rt_min;
+    for &rt in &sorted_rts {
+        count += 1;
+        if count >= target_work && (rt - band_start_rt) >= rt_floor {
+            rt_cuts.push(rt);
+            band_start_rt = rt;
+            count = 0;
+        }
+    }
+    drop(sorted_rts);
+    let n_rt = rt_cuts.len() + 1;
+    if n_rt < 2 {
+        return None;
+    }
+
+    // RT edges (n_rt + 1 points): [rt_min, cuts.., rt_max⁺]. Band i spans [rt_edges[i], rt_edges[i+1]).
+    let mut rt_edges: Vec<f64> = Vec::with_capacity(n_rt + 1);
+    rt_edges.push(rt_min);
+    rt_edges.extend_from_slice(&rt_cuts);
+    rt_edges.push(rt_max + 1.0);
+
+    let n_tiles = n_rt * n_mz;
+
+    // Interior cut points for O(log) tile lookup (partition_point counts cuts at/below the coordinate).
+    let rt_band_of = |rt: f64| -> usize { rt_cuts.partition_point(|&b| b <= rt) };
+    let mz_col_of = |mz: f64| -> usize { mz_edges[1..n_mz].partition_point(|&b| b <= mz) };
+
+    // --- Group seeds by tile, tallest-first within each tile, without copying peaks. ----------------
+    // Sort an index permutation by (tile asc, intensity desc), then materialise one reordered peak Vec
+    // so each tile is a contiguous slice (mirrors the 1-D path; one seed pool resident).
+    let seed_tiles: Vec<u32> = seeds
+        .iter()
+        .map(|p| (rt_band_of(p.retention_time as f64) * n_mz + mz_col_of(p.m() as f64)) as u32)
+        .collect();
+    let mut order: Vec<u32> = (0..seeds.len() as u32).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (a as usize, b as usize);
+        seed_tiles[a]
+            .cmp(&seed_tiles[b])
+            .then_with(|| seeds[b].intensity.total_cmp(&seeds[a].intensity))
+    });
+    let ordered: Vec<IndexedMassSpectralPeak> = order.iter().map(|&i| seeds[i as usize]).collect();
+    let ordered_tiles: Vec<u32> = order.iter().map(|&i| seed_tiles[i as usize]).collect();
+    drop(seeds);
+    drop(seed_tiles);
+    drop(order);
+
+    // Contiguous [start, end) slice range for each tile in `ordered`.
+    let mut ranges: Vec<(usize, usize)> = vec![(0, 0); n_tiles];
+    let mut start = 0usize;
+    for (t, range) in ranges.iter_mut().enumerate() {
+        let mut end = start;
+        while end < ordered.len() && ordered_tiles[end] as usize == t {
+            end += 1;
+        }
+        *range = (start, end);
+        start = end;
+    }
+    drop(ordered_tiles);
+
+    // --- 4-colour strip-seeded schedule (§3, §5). --------------------------------------------------
+    // Claims accumulate across colours: `per_tile_claims[t]` is the peaks tile `t` newly claimed (used
+    // to strip-seed its later-colour king-neighbours); `global_claimed` is the merge/collision detector.
+    let mut per_tile_claims: Vec<Vec<IndexedMassSpectralPeak>> =
+        (0..n_tiles).map(|_| Vec::new()).collect();
+    let mut per_tile_features: Vec<Vec<DetectedFeature>> =
+        (0..n_tiles).map(|_| Vec::new()).collect();
+    let mut global_claimed: HashSet<PeakKey> = HashSet::new();
+    let mut collisions = 0usize;
+
+    for color in 0..4u8 {
+        let tiles: Vec<usize> = (0..n_tiles)
+            .filter(|&t| tile_color(t / n_mz, t % n_mz) == color)
+            .collect();
+        if tiles.is_empty() {
+            continue;
+        }
+        // Snapshot the accumulated claims so the parallel closure borrows them immutably.
+        let claims_ref = &per_tile_claims;
+        let results: Vec<(usize, Vec<DetectedFeature>, Vec<IndexedMassSpectralPeak>)> = tiles
+            .par_iter()
+            .map(|&t| {
+                let i_rt = t / n_mz;
+                let i_mz = t % n_mz;
+                let box_rt_lo = rt_edges[i_rt] - reach_rt;
+                let box_rt_hi = rt_edges[i_rt + 1] + reach_rt;
+                let box_mz_lo = mz_edges[i_mz] - strip_pad_mz;
+                let box_mz_hi = mz_edges[i_mz + 1] + strip_pad_mz;
+
+                // Strip-seed from earlier-colour king-neighbours' claims that fall in the padded box.
+                let mut seeded: HashSet<PeakKey> = HashSet::new();
+                for di in -1i64..=1 {
+                    for dj in -1i64..=1 {
+                        if di == 0 && dj == 0 {
+                            continue;
+                        }
+                        let ni = i_rt as i64 + di;
+                        let nj = i_mz as i64 + dj;
+                        if ni < 0 || ni >= n_rt as i64 || nj < 0 || nj >= n_mz as i64 {
+                            continue;
+                        }
+                        let (ni, nj) = (ni as usize, nj as usize);
+                        if tile_color(ni, nj) >= color {
+                            continue; // only already-processed (earlier) colours hold claims
+                        }
+                        for p in &claims_ref[ni * n_mz + nj] {
+                            let rt = p.retention_time as f64;
+                            let mz = p.m() as f64;
+                            if rt >= box_rt_lo
+                                && rt <= box_rt_hi
+                                && mz >= box_mz_lo
+                                && mz <= box_mz_hi
+                            {
+                                seeded.insert(p.key());
+                            }
+                        }
+                    }
+                }
+
+                let reanchor = Reanchor {
+                    reach_mz,
+                    mz_lo: mz_edges[i_mz],
+                    mz_hi: mz_edges[i_mz + 1],
+                };
+                let (lo, hi) = ranges[t];
+                let (features, claimed) =
+                    detect_bin(engine, params, &ppm, &ordered[lo..hi], seeded, Some(&reanchor));
+                (t, features, claimed)
+            })
+            .collect();
+
+        // Barrier: merge each tile's claims serially (single thread) — the merge is the detector.
+        for (t, features, claimed) in results {
+            for p in &claimed {
+                if !global_claimed.insert(p.key()) {
+                    collisions += 1;
+                }
+            }
+            per_tile_claims[t] = claimed;
+            per_tile_features[t] = features;
+        }
+    }
+
+    // --- Reassemble in fixed (colour, tile) order — deterministic regardless of thread scheduling. --
+    let mut features: Vec<DetectedFeature> = Vec::new();
+    for color in 0..4u8 {
+        for t in 0..n_tiles {
+            if tile_color(t / n_mz, t % n_mz) == color {
+                features.append(&mut per_tile_features[t]);
+            }
+        }
+    }
+
+    if collisions > 0 {
+        // Nominal (margin-respecting, re-anchored) mode must produce zero collisions — a nonzero count
+        // is the correctness canary that the width floor was violated or reach was mis-set.
+        eprintln!(
+            "[DETECT_TILE2D] WARNING: {collisions} same-colour claim collisions (expected 0 in \
+             margin-respecting mode) — losers dropped; check reach_mz / tile floor."
+        );
+    }
+    if profile {
+        eprintln!(
+            "  [DETECT_TILE2D] total {:.2}s | grid {}×{} = {} tiles ({} RT bands, {} m/z cols) | \
+             {} threads | reach_rt {:.2} min / reach_mz {:.1} Da (strip pad {:.1} Da) | \
+             mz_width {:.0} Da | collisions {} | features {}",
+            t0.elapsed().as_secs_f64(),
+            n_rt,
+            n_mz,
+            n_tiles,
+            n_rt,
+            n_mz,
+            threads,
+            reach_rt,
+            reach_mz,
+            strip_pad_mz,
+            mz_width,
+            collisions,
+            features.len(),
+        );
+    }
+
+    Some(features)
+}
+
+/// Per-tile seed re-anchoring context for the 2-D tiling detector (§6a). Present only on the 2-D
+/// path; the serial reference and the 1-D RT-binning path pass `None`, keeping them byte-identical.
+///
+/// `mz_lo`/`mz_hi` are the tile's own m/z column bounds; a seed within `reach_mz` of either is a
+/// *border* seed whose envelope apex might sit across the border, and only those seeds pay the halo
+/// scan. `reach_mz` is the halo radius (also the strip pad and the tile-width floor — see §1).
+struct Reanchor {
+    reach_mz: f64,
+    mz_lo: f64,
+    mz_hi: f64,
+}
+
+impl Reanchor {
+    /// True when `seed_mz` is within `reach_mz` of this tile's m/z border — the only seeds whose
+    /// envelope can straddle into a neighbouring tile, so the only ones that need the halo scan.
+    #[inline]
+    fn is_border(&self, seed_mz: f64) -> bool {
+        seed_mz - self.mz_lo < self.reach_mz || self.mz_hi - seed_mz < self.reach_mz
+    }
+}
+
+/// Processes one seed through the serial accept/reject pipeline against `claimed`, pushing an accepted
+/// feature onto `features` and every newly-claimed peak onto both `claimed` and `claimed_peaks`. Factored
+/// out of [`detect_bin`] so a re-anchored apex peak (§6a) can be run through the identical logic before
+/// its originating border seed. A seed already in `claimed` is a no-op (so a re-anchored apex that also
+/// appears later as its own tile's seed is processed exactly once).
+#[allow(clippy::too_many_arguments)]
+fn process_seed(
+    engine: &PeakIndexingEngine,
+    params: &TraceKernelParameters,
+    ppm: &PpmTolerance,
+    seed: &IndexedMassSpectralPeak,
+    claimed: &mut HashSet<PeakKey>,
+    claimed_peaks: &mut Vec<IndexedMassSpectralPeak>,
+    features: &mut Vec<DetectedFeature>,
+) {
+    if claimed.contains(&seed.key()) {
+        return;
+    }
+
+    // Cheap charge-independent persistence pre-gate (same as serial): a seed whose own-m/z XIC
+    // spans too few scans is a noise spike; retire it before the six-charge scoring.
+    let (s_lo, s_hi) = trace_seed_extent(engine, seed, params, ppm, claimed);
+    if params.min_feature_scans > 1 && (s_hi - s_lo + 1) < params.min_feature_scans as i32 {
+        if claimed.insert(seed.key()) {
+            claimed_peaks.push(*seed);
+        }
+        return;
+    }
+
+    let window = seed_rt_window(engine, seed, params);
+    let mut best: Option<HypothesisScore> = None;
+    for z in params.min_charge..=params.max_charge {
+        if z == 0 {
+            continue;
+        }
+        let score = score_hypothesis(engine, seed, z, params, ppm, claimed, &window);
+        let better = match &best {
+            None => true,
+            Some(b) => score.response > b.response,
+        };
+        if better {
+            best = Some(score);
+        }
+    }
+
+    let best = match best {
+        Some(b) => b,
+        None => return,
+    };
+    if best.num_isotopes_observed < params.min_isotopes_observed || best.response <= 0.0 {
+        if claimed.insert(seed.key()) {
+            claimed_peaks.push(*seed);
+        }
+        return;
+    }
+
+    let traced = gather_extent_peaks(engine, seed, &best, s_lo, s_hi, params, ppm, claimed);
+    if params.min_feature_scans > 1 {
+        let distinct_scans: HashSet<i32> =
+            traced.iter().map(|p| p.zero_based_scan_index).collect();
+        if distinct_scans.len() < params.min_feature_scans {
+            if claimed.insert(seed.key()) {
+                claimed_peaks.push(*seed);
+            }
+            return;
+        }
+    }
+
+    for p in &traced {
+        if claimed.insert(p.key()) {
+            claimed_peaks.push(*p);
+        }
+    }
+    features.push(build_feature(best, traced));
+}
+
+/// Detects features within a single tile (or RT bin): the serial greedy accept/reject loop, run over one
+/// tile's `seeds` (already tallest-first) against a tile-local `claimed` set. Pre-seed `claimed` with any
+/// prior phase's claims that overlap this tile (odd RT bin, or an earlier-colour neighbour's strip); pass
+/// an empty set for a fresh bin.
+///
+/// `reanchor` is `Some` only on the 2-D tiling path: for a seed within `reach_mz` of an m/z tile border it
+/// runs the seed-re-anchoring repair (§6a) — search the m/z halo at the seed's apex scan for the tallest
+/// *unclaimed* peak and process THAT first, so a minor tooth whose apex straddled into a neighbour tile
+/// cannot anchor a mis-placed comb. `None` (serial reference and 1-D RT binning, where an envelope's teeth
+/// share a scan and never split across the tiling axis) keeps the loop byte-identical to before.
+///
+/// Returns the tile's accepted features and **the peaks it newly claimed** (paired with their RT/m-z via the
+/// peak record). The `insert` return value guarantees only genuinely-new keys are reported, so a pre-seeded
+/// key is never echoed back. This mirrors the body of [`detect_features_serial`] minus the global progress /
+/// coverage / knee / reject-stop bookkeeping, which does not compose with per-tile execution.
+fn detect_bin(
+    engine: &PeakIndexingEngine,
+    params: &TraceKernelParameters,
+    ppm: &PpmTolerance,
+    seeds: &[IndexedMassSpectralPeak],
+    mut claimed: HashSet<PeakKey>,
+    reanchor: Option<&Reanchor>,
+) -> (Vec<DetectedFeature>, Vec<IndexedMassSpectralPeak>) {
+    let mut features: Vec<DetectedFeature> = Vec::new();
+    let mut claimed_peaks: Vec<IndexedMassSpectralPeak> = Vec::new();
+
+    for seed in seeds {
+        // Seeds are intensity-descending within the tile, so once one falls below the floor every
+        // remaining seed does too.
+        if (seed.intensity as f64) < params.min_seed_intensity {
+            break;
+        }
+
+        // §6a seed re-anchoring: a border seed may be a minor tooth of an envelope whose apex sits in
+        // a neighbouring m/z tile. Enforce "the taller peak goes first" locally — find the tallest
+        // unclaimed peak in the m/z halo at this seed's scan and run it first. It is unconditionally
+        // safe (if it is this seed's true apex the comb anchors correctly and claims the seed as a
+        // tooth; if it is a distinct co-eluting species both are detected). Falls through to the seed
+        // below, which `process_seed` no-ops if the re-anchored feature already claimed it.
+        if let Some(re) = reanchor {
+            let seed_mz = seed.m() as f64;
+            if re.is_border(seed_mz) && !claimed.contains(&seed.key()) {
+                if let Some(apex) = engine.tallest_unclaimed_in_mz_at_scan(
+                    seed_mz - re.reach_mz,
+                    seed_mz + re.reach_mz,
+                    seed.zero_based_scan_index,
+                    &claimed,
+                ) {
+                    if apex.key() != seed.key() {
+                        process_seed(
+                            engine,
+                            params,
+                            ppm,
+                            &apex,
+                            &mut claimed,
+                            &mut claimed_peaks,
+                            &mut features,
+                        );
+                    }
+                }
+            }
+        }
+
+        process_seed(
+            engine,
+            params,
+            ppm,
+            seed,
+            &mut claimed,
+            &mut claimed_peaks,
+            &mut features,
+        );
+    }
+
+    (features, claimed_peaks)
 }
 
 /// Assembles a [`DetectedFeature`] from an accepted hypothesis and its **traced** peak set (Change A).
@@ -1820,6 +2746,139 @@ mod tests {
         for k in 1..=1000u64 {
             assert!(!knee.observe(k, 0.0), "disabled knee must never stop");
         }
+    }
+
+    #[test]
+    fn reanchoring_recovers_apex_when_seeded_from_minor_tooth() {
+        // §6a: a clean z=2 envelope whose monoisotope is the most-abundant tooth (the apex). Seed the
+        // detector from the +1 *minor* tooth alone — exactly what an m/z tile border does when the apex
+        // lands in the neighbouring column. WITHOUT re-anchoring the comb anchors its most-abundant
+        // tooth on the +1 peak → mono mis-placed by ~1 unit (a bogus feature). WITH re-anchoring the
+        // halo scan finds the taller mono and processes the true envelope, so the recovered feature is
+        // identical to seeding from the apex — regardless of which side's tile runs first.
+        let (scans, mono_mz) = averagine_envelope_scans(1200.0, 2, 9);
+        let engine = PeakIndexingEngine::index_peaks(&scans).expect("indexed");
+        let params = TraceKernelParameters {
+            ppm_tolerance: 5.0,
+            rt_sigma_minutes: 0.15,
+            rt_half_window_minutes: 0.3,
+            ..TraceKernelParameters::default()
+        };
+        let ppm = PpmTolerance::new(params.ppm_tolerance);
+        let spacing = C13_MINUS_C12 / 2.0;
+        let apex_scan = 4;
+
+        let mono_peak = *engine.get_indexed_peak(mono_mz, apex_scan, &ppm).expect("mono tooth");
+        let plus1_peak = *engine
+            .get_indexed_peak(mono_mz + spacing, apex_scan, &ppm)
+            .expect("+1 tooth");
+        assert!(
+            plus1_peak.intensity < mono_peak.intensity,
+            "the +1 tooth must be a minor tooth for this fixture"
+        );
+
+        // reach_mz comfortably covers a tooth spacing; the tight mz_lo/mz_hi make the seed a border seed.
+        let ctx = |p: &IndexedMassSpectralPeak| Reanchor {
+            reach_mz: 6.0,
+            mz_lo: p.m() as f64 - 0.1,
+            mz_hi: p.m() as f64 + 0.1,
+        };
+
+        // Seed from the minor tooth, re-anchoring ON.
+        let re_b = ctx(&plus1_peak);
+        let (feat_b, _) =
+            detect_bin(&engine, &params, &ppm, &[plus1_peak], HashSet::new(), Some(&re_b));
+        // Seed from the apex, re-anchoring ON — the order-independence reference.
+        let re_a = ctx(&mono_peak);
+        let (feat_a, _) =
+            detect_bin(&engine, &params, &ppm, &[mono_peak], HashSet::new(), Some(&re_a));
+
+        assert_eq!(feat_b.len(), 1, "re-anchored minor-tooth seed yields exactly one feature");
+        assert_eq!(feat_a.len(), 1);
+        assert_eq!(feat_b[0].charge, 2, "recovered charge");
+        approx(feat_b[0].monoisotopic_mass, 1200.0, 0.02);
+        // Same envelope regardless of which tooth seeded it.
+        assert_eq!(feat_b[0].charge, feat_a[0].charge);
+        approx(feat_b[0].monoisotopic_mass, feat_a[0].monoisotopic_mass, 1e-6);
+
+        // Contrast: WITHOUT re-anchoring the minor-tooth seed mis-places the mono (off by ~1 unit),
+        // so it must NOT recover 1200 — proving re-anchoring is what fixes the straddle.
+        let (feat_none, _) =
+            detect_bin(&engine, &params, &ppm, &[plus1_peak], HashSet::new(), None);
+        assert!(
+            feat_none.is_empty() || (feat_none[0].monoisotopic_mass - 1200.0).abs() > 0.1,
+            "without re-anchoring the minor-tooth seed should mis-place the mono, got {:?}",
+            feat_none.first().map(|f| f.monoisotopic_mass)
+        );
+    }
+
+    /// Eight well-separated clean z=2 elutions spread across RT and m/z — wide/long enough to yield a
+    /// ≥ 2×2 margin-respecting tile grid. Each envelope is comfortably isolated so there is no
+    /// co-elution or ambiguous boundary; the 2-D path should match serial exactly here.
+    fn tiling_fixture() -> Vec<Scan> {
+        let specs = [
+            (800.0, 1.0),
+            (1000.0, 4.0),
+            (1300.0, 7.0),
+            (1600.0, 10.0),
+            (900.0, 13.0),
+            (1100.0, 16.0),
+            (1400.0, 19.0),
+            (1700.0, 22.0),
+        ];
+        let mut scans: Vec<Scan> = Vec::new();
+        for (i, &(mass, rt0)) in specs.iter().enumerate() {
+            scans.extend(elution_scans(mass, 2, 15, 7, 0.15, rt0, (i as i32) * 100 + 1));
+        }
+        scans
+    }
+
+    #[test]
+    fn tile2d_is_deterministic_and_matches_serial_on_clean_data() {
+        let scans = tiling_fixture();
+        let engine = PeakIndexingEngine::index_peaks(&scans).expect("indexed");
+        let params = TraceKernelParameters {
+            ppm_tolerance: 5.0,
+            rt_sigma_minutes: 0.15,
+            rt_half_window_minutes: 0.3,
+            // Trace cap wide enough to claim each ~1.4-min elution whole (no fragmentation), so every
+            // envelope is exactly one feature and there is no fragment to straddle a tile boundary.
+            trace_max_half_width_minutes: 1.5,
+            ..TraceKernelParameters::default()
+        };
+
+        let tiled = detect_features_tile2d(&engine, &params)
+            .expect("fixture is wide/long enough for a ≥ 2×2 tile grid");
+        // Deterministic: a second run reproduces the first exactly (order included).
+        let tiled2 = detect_features_tile2d(&engine, &params).expect("second tiled run");
+        assert_eq!(tiled.len(), tiled2.len(), "tiled run must be deterministic in count");
+        for (a, b) in tiled.iter().zip(tiled2.iter()) {
+            assert_eq!(a.charge, b.charge);
+            approx(a.monoisotopic_mass, b.monoisotopic_mass, 1e-12);
+            approx(a.apex_rt, b.apex_rt, 1e-12);
+        }
+
+        // Equivalent to serial on this clean, well-separated data: same feature set (charge, mono).
+        let serial = detect_features_serial(&engine, &params);
+        assert_eq!(
+            tiled.len(),
+            serial.len(),
+            "tiled feature count {} must match serial {} on clean data",
+            tiled.len(),
+            serial.len()
+        );
+        let key = |f: &DetectedFeature| (f.charge, (f.monoisotopic_mass * 100.0).round() as i64);
+        let mut tk: Vec<_> = tiled.iter().map(key).collect();
+        let mut sk: Vec<_> = serial.iter().map(key).collect();
+        tk.sort();
+        sk.sort();
+        assert_eq!(tk, sk, "tiled and serial must agree on the (charge, mono) multiset");
+        // Sanity: at least the eight seeded envelopes are recovered.
+        assert!(
+            serial.len() >= 8,
+            "the fixture holds at least eight detectable envelopes, got {}",
+            serial.len()
+        );
     }
 
     #[test]

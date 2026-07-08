@@ -194,6 +194,179 @@ worst-to-best:
 Combined ceiling on a batch of long files: per-file parallelism (≈ cores) × the 1.86× already banked
 in `get_indexed_peak` ≈ an order of magnitude over today's serial detect, memory permitting.
 
+## IMPLEMENTED: intra-file red-black RT binning (Option B, variant of B.2)
+
+Shipped instead of B.3 — chosen for single-file latency with a low, constant memory footprint (one
+file resident, no per-batch `claimed` snapshots). It is a **parity-approximate** spatial scheme, not
+the bit-identical B.3. Opt-in via the **`DETECT_PARALLEL`** env var; see
+`trace_kernel.rs::detect_features_parallel`. The serial path (`detect_features_serial`) is untouched
+and remains the default and the reference — the 88-95% hot function `score_hypothesis` and its two
+siblings (`trace_seed_extent`, `gather_extent_peaks`) keep their exact single-`HashSet` signatures, so
+there is **zero hot-path cost** to the serial build.
+
+### The scheme
+
+- **Equal-work bins with a 4-min floor.** Seeds are partitioned into contiguous RT bins that are
+  simultaneously ≈ equal seed count (load balance) and ≥ `DETECT_BIN_MIN_WIDTH_MINUTES = 4.0` wide
+  (correctness). A bin closes only when both hold, so dense regions give min-width bins and sparse
+  regions widen to carry a full share.
+- **Red-black (even/odd) two-phase.** Bins are 2-colored by index parity. Even bins are detected in
+  parallel (`rayon` `par_iter`), a barrier merges their claims, then odd bins are detected in parallel
+  against those claims. Every pair of same-color bins is separated by a full ≥ 4-min bin, and a seed
+  reaches at most `bin_reach_minutes` = `max(rt_half_window_minutes, trace_max_half_width_minutes)` ≈
+  0.5 min from its apex — so **2 × reach (~1 min) ≪ bin width (4 min)** and concurrently-processed bins
+  provably cannot claim the same peak. Each bin therefore runs the ordinary serial loop with its own
+  `claimed` set; **no locking on the hot path.**
+- **Odd-bin seeding is a thin strip, not the whole claim set.** An odd bin is pre-seeded only with the
+  even-phase claims within `reach` of its span (found by binary search on RT-sorted even claims) —
+  everything it could possibly observe from the earlier phase, and nothing more. Keeps memory low.
+- **Deterministic.** Results are reassembled in bin-index order; each bin is serial internally, so the
+  output is identical run-to-run (only *scheduling* varies across threads).
+
+### Constraint: does not compose with the global-stop heuristics
+
+Coverage target < 1, the TIC-knee auto-stop, and the reject-rate auto-stop all key on a **global**
+tallest-first traversal, which binning breaks. When any is engaged, `detect_features` prints a notice
+and falls back to serial. So today it is **parallel-full-detect XOR coverage/knee early-stop**, not
+both. (Future work: give each bin a per-bin coverage/knee target — local fractions compose to roughly
+the global one — to recover early-stop under binning.)
+
+### Measured results (24 logical / 12 physical cores, `COVERAGE_TARGET=1.0`, `DETECT_ONLY`)
+
+**10-min file** (`04-17-23_CA_Tryp_HCD_10min.raw`) — only 5 bins (3 even, 2 odd) because the run is
+short, so parallelism is capped well below core count:
+
+| | detect time | features |
+|---|---:|---:|
+| serial | 13.40 s | 142,958 |
+| parallel | 7.72 s | 142,981 |
+
+**1.74×** here is the floor, not the ceiling — 5 bins can't use 24 threads.
+
+**65-min file** (`HFX_MB_14751_5_02062022.raw`, 16.8M peaks) — **20 bins (10 even, 10 odd)**, the real
+target:
+
+| | detect time | features |
+|---|---:|---:|
+| serial | 220.73 s | 972,322 |
+| parallel | **46.87 s** | 972,277 |
+
+**4.71× on detect** (20 bins across 24 threads; feature counts within 0.005%). End-to-end wall incl.
+the shared 18 s read/index: 243.6 s → 70.0 s (**3.5×**). The speedup is ~4.7× rather than the ~10×
+the 10-bins-per-phase geometry suggests, because (1) each phase's wall is bounded by its *slowest*
+bin, and the 4-min floor forces dense-region bins to carry more than an equal share, and (2) the two
+phases run in series with a barrier between (`slowest_even + slowest_odd`, not their max). Squarely in
+the doc's predicted 4-8× band for intra-file parallelism.
+
+(The serial 220.73 s here is well under the 732 s recorded higher up in this doc: that earlier
+measurement predates the trace-first persistence pre-gate, which retires most seeds on a cheap
+charge-independent XIC check *before* the six-charge scoring — 6.3M `score_hypothesis` calls now vs
+24.5M then. The parallel/serial pair above is same-settings, so the 4.71× is apples-to-apples.)
+
+### Parity: the boundary deviation, quantified
+
+On the 10-min file, a fuzzy join (charge + mass ≤ 5 ppm + apex RT ≤ 0.02 min) of serial vs parallel
+detected features:
+
+- **142,283 identical** (99.04%).
+- 675 serial-only, 698 parallel-only → **1,373 features differ (0.96%)**, balanced add/drop.
+- **Summed intensity identical to 0.0014%.**
+
+The balance and intensity conservation confirm the mechanism is pure boundary *reassignment* (the even
+phase claims a boundary peak before the odd phase regardless of which side is taller), **not**
+fragmentation — a claim-sharing bug would inflate parallel counts and intensity, which is not observed.
+99% of features are untouched; only those within `reach` of a bin edge can differ.
+
+## IMPLEMENTED: intra-file 2-D m/z×RT tiling (generalizes the red-black RT path)
+
+Opt-in via **`DETECT_TILE2D`** (takes precedence over `DETECT_PARALLEL`); see
+`trace_kernel.rs::detect_features_tile2d` and the spec `agent_info/Detector-2D-Tiling-Spec.md`.
+Generalizes the 1-D red-black scheme (2 colors, RT only) to a 2-D grid, 4-colored so non-adjacent tiles
+run concurrently. The serial path stays the default/reference and byte-identical; the 1-D path is
+untouched. The hot scorers keep their single-`HashSet` signatures (zero serial-path cost).
+
+### Why 2-D
+The RT claim reach grows with the trace cap (forcing coarse RT slices), but the m/z claim reach is
+fixed by the isotope model. Tiling the m/z axis exposes independent regions exactly when RT slices go
+coarse. It also simply yields more tiles: on the 2-hr file a 24-RT-band × 12-m/z-column grid = **288
+tiles** vs the 1-D path's 20 bins, so each phase's "slowest tile" tail is much smaller.
+
+### What's new over 1-D
+- **Grid + 4-coloring.** Equal-work RT bands (≥ 4-min floor, the 1-D walk) × fixed 96-Th m/z columns;
+  `color = (i_rt&1, i_mz&1)`, colors run in series 0→3, tiles within a color in parallel.
+- **Strip seeding from king-neighbours.** Each tile pre-seeds its `claimed` from the earlier-colour
+  king-neighbours' claims in a padded box — the 2-D analogue of the 1-D odd-bin strip.
+- **Seed re-anchoring (§6a) — the m/z-specific correctness piece.** RT tiling never splits an envelope
+  (teeth share a scan), but an m/z border cuts *through* one: a tile's local-tallest seed can be a minor
+  tooth whose true apex is across the border, which would anchor a mis-placed comb (wrong charge/mono →
+  bogus feature). Before seeding a border seed the detector searches an m/z halo at that scan for the
+  tallest unclaimed peak and processes it first — enforcing "the taller peak goes first" locally, as
+  serial does globally. Backed by the new `PeakIndexingEngine::tallest_unclaimed_in_mz_at_scan`.
+- **Collision detector.** The per-colour barrier merge into `global_claimed` *is* the detector: a
+  duplicate insert (impossible in margin-respecting mode) is counted and the loser dropped, with a
+  warning. It is the correctness canary — a nonzero count means the margin was mis-set.
+
+### Reach geometry (two decoupled m/z quantities — a spec correction)
+- **Halo radius / border threshold (`reach_mz`, default 4 Th).** The envelope *span* — how far a minor
+  tooth sits from its apex. Measured on the IonStar 2-hr file (1.1 M detections), the per-feature m/z
+  reach `= observed_isotopes × (C13−C12)/z` is bounded in **thomson and shrinks with charge** (isotope
+  count grows with mass but the `1.0033/z` spacing shrinks faster): z=1 is worst (median 3 Th, max 7 Th),
+  everything heavier tighter. Overall p99 = 4.0 Th, p99.9 = 5.0 Th; only ~2 % exceed 4 Th. So 4 Th covers
+  ~98 % of straddles directly; the rare tail is a mis-anchor backstopped by the collision detector, not a
+  lost/double-claimed peak.
+- **Claim bound (`claim_reach_mz` = `max_isotopes × (C13−C12)/min_charge` ≈ 12 Th).** The hard bound on
+  how far *any* comb reaches — used only for the strip pad (`reach_mz + claim_reach_mz`) and the column
+  floor (`2 ×` the pad), so a neighbour always strips a long z=1 comb's tail. Kept conservative because
+  it costs nothing at 96-Th columns.
+
+The first cut conflated these (a single 6 Th for halo + pad + floor) and logged **67 collisions** on the
+10-min file: a z=1 comb reaches ~12 Th and a re-anchored claim reaches `halo + claim`, both past a 6-Th
+pad. Decoupling drove collisions to **0** while keeping the halo cheap.
+
+### Halo sizing (why 4 Th, not 6)
+Halo scan cost grows ~radius² (scan width × border-seed fraction). Sweeping `DETECT_TILE2D_REACH_MZ`,
+with feature counts flat to < 0.1 %:
+
+| halo | 10-min detect | 2-hr detect |
+|---:|---:|---:|
+| 12 Th | 12.9 s | — |
+| 6 Th | 7.05 s | 67.2 s |
+| **4 Th (default)** | **5.90 s** | **63.0 s** |
+| 2 Th | 5.55 s | 62.2 s |
+
+Most of the win is at 6→4; below 4 it flattens. 4 Th is the default.
+
+### Measured results (24 logical / 12 physical cores, `COVERAGE_TARGET=1.0`, `DETECT_ONLY`, halo 4 Th)
+
+**10-min file** (`04-17-23_CA_Tryp_HCD_10min.raw`) — 5×12 = 60 tiles:
+
+| | detect time | features | ΣTIC | collisions |
+|---|---:|---:|---:|---:|
+| serial | 18.72 s | 142,958 | 90.0% | — |
+| 2-D tiling | 5.90 s (**3.2×**) | 143,132 | 90.0% | 0 |
+
+**2-hr IonStar file** (`B03_19_..._2hrs_30B_9B.raw`, 10,582 MS1 scans, 22.5M peaks) — 24×12 = 288
+tiles, the real target:
+
+| | detect time | features | ΣTIC | collisions |
+|---|---:|---:|---:|---:|
+| serial | 413.74 s | 1,113,403 | 96.5% | — |
+| 2-D tiling | **63.03 s (6.6×)** | 1,116,158 | 96.5% | 0 |
+
+6.6× on detect — top of the doc's predicted 4-8× band, above the 1-D path's 4.71× (measured on a
+*different* 65-min file, HFX_MB), because the 288-tile grid parallelizes far better than 20 RT bins.
+Baselines are not cross-file comparable: this 413.7 s is B03_19 at full coverage, not the 1-D section's
+220.7 s on HFX_MB.
+
+### Parity: boundary deviation
+Fuzzy join (charge + mass ≤ 10 ppm + apex RT ≤ 0.02 min), serial vs 2-D detected features:
+- **10-min:** 97.4 % match, 2.5 % boundary deviation, ΣTIC to 0.015 %.
+- **2-hr:** 94.8 % match, 5.2 % boundary deviation, ΣTIC to **0.0045 %**.
+
+Higher deviation than the 1-D scheme's ~1 % is expected — 288 tiles have far more edge length than 20
+bins — but ΣTIC conservation to ≤ 0.015 % confirms it is boundary *re-fragmentation*, not lost or
+double-claimed signal (a claim-sharing bug would inflate counts + intensity, and collisions are 0).
+
 ## How to reproduce
 
 ```
@@ -201,4 +374,11 @@ cargo build --release --example detect_features_tsv
 # sub-stage attribution:
 DETECT_PROFILE=1 ./target/release/examples/detect_features_tsv <raw> <out.tsv>
 # stage timings are always printed + appended to <out>.log
+
+# 1-D red-black RT binning (needs full coverage — global-stop heuristics disable it):
+COVERAGE_TARGET=1.0 DETECT_ONLY=1 DETECT_PROFILE=1 DETECT_PARALLEL=1 \
+  ./target/release/examples/detect_features_tsv <raw> <out.tsv>
+# 2-D m/z×RT tiling (default halo 4 Th; override with DETECT_TILE2D_REACH_MZ / DETECT_TILE2D_MZ_WIDTH):
+COVERAGE_TARGET=1.0 DETECT_ONLY=1 DETECT_PROFILE=1 DETECT_TILE2D=1 \
+  ./target/release/examples/detect_features_tsv <raw> <out.tsv>
 ```

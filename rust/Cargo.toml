@@ -23,3 +23,6 @@ repository = "https://github.com/smith-chem-wisc/mzLib"
 pyo3 = { version = "0.23", default-features = false }
 numpy = "0.23"
 arrow = "54"
+# Data-parallelism for the untargeted detector's intra-file red-black RT binning (opt-in via
+# `DETECT_PARALLEL`; the default detect path stays single-threaded and bit-for-bit unchanged).
+rayon = "1.10"

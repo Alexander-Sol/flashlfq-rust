@@ -378,6 +378,20 @@ fn main() {
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(1e-7);
+    // Auto-stop at the seed-rejection-rate threshold (opt-in; default OFF). DETECT_REJECT_STOP=1
+    // enables it; stops once the rolling fraction of considered seeds being rejected reaches
+    // DETECT_REJECT_FRAC (default 0.50) over a window of DETECT_REJECT_WINDOW scored seeds
+    // (default 20000). Self-referential (keys on the detector's own hit-rate), unlike the TIC knee.
+    let reject_stop_enabled =
+        matches!(std::env::var("DETECT_REJECT_STOP").as_deref(), Ok("1") | Ok("true"));
+    let reject_stop_frac = std::env::var("DETECT_REJECT_FRAC")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.50);
+    let reject_stop_window = std::env::var("DETECT_REJECT_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(20_000);
     let base = TraceKernelParameters {
         ppm_tolerance: 10.0,
         min_seed_intensity,
@@ -394,12 +408,21 @@ fn main() {
         knee_window_seeds,
         knee_slope_frac,
         knee_abs_eps,
+        reject_stop_enabled,
+        reject_stop_window,
+        reject_stop_frac,
         ..TraceKernelParameters::default()
     };
     if knee_stop_enabled {
         eprintln!(
             "knee auto-stop: ENABLED (window {} seeds, slope_frac {}, abs_eps {:.0e}) — stops early at the coverage knee",
             knee_window_seeds, knee_slope_frac, knee_abs_eps
+        );
+    }
+    if reject_stop_enabled {
+        eprintln!(
+            "reject-rate auto-stop: ENABLED (window {} scored seeds, frac {:.2}) — stops when that fraction of considered seeds is being rejected",
+            reject_stop_window, reject_stop_frac
         );
     }
     eprintln!(
@@ -454,6 +477,67 @@ fn main() {
     );
     write_detected_tsv(&detected_path, &detected);
     eprintln!("  wrote {} detected features -> {detected_path}", detected.len());
+
+    // MZ_STRADDLE=1: measure the m/z-tiling straddle exposure for the planned 2-D parallel detector.
+    // For each detected feature, emit its claimed isotope envelope's m/z span and the largest tooth on
+    // each side of the apex (the most-intense claimed peak). A 2-D m/z tile border that falls inside an
+    // envelope can orphan a minor tooth into a neighbouring tile, where it may seed a mis-anchored
+    // feature — so the span distribution (vs the tile width, ≥ 2·reach_mz) bounds how often re-anchoring
+    // is needed. Off-apex tooth intensity vs the seed floor says whether an orphaned tooth could even
+    // seed. Analyse the emitted TSV in Python.
+    if std::env::var("MZ_STRADDLE").is_ok() {
+        let reach_mz =
+            params.max_isotopes as f64 * (C13_MINUS_C12 / params.min_charge.max(1) as f64);
+        let spath = sibling(out_path, "straddle");
+        if let Some(mut w) = open_out(&spath) {
+            writeln!(
+                w,
+                "apex_mz\tapex_int\tcharge\tn_peaks\tmz_min\tmz_max\tspan\t\
+                 left_max_int\tleft_dist\tright_max_int\tright_dist"
+            )
+            .unwrap();
+            for f in &detected {
+                if f.peaks.is_empty() {
+                    continue;
+                }
+                let apex = f
+                    .peaks
+                    .iter()
+                    .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
+                    .unwrap();
+                let amz = apex.m() as f64;
+                let (mut mzmin, mut mzmax) = (f64::INFINITY, f64::NEG_INFINITY);
+                let (mut lmax, mut ldist, mut rmax, mut rdist) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                for p in &f.peaks {
+                    let (pm, pi) = (p.m() as f64, p.intensity as f64);
+                    mzmin = mzmin.min(pm);
+                    mzmax = mzmax.max(pm);
+                    if pm < amz - 1e-6 {
+                        if pi > lmax {
+                            lmax = pi;
+                            ldist = amz - pm;
+                        }
+                    } else if pm > amz + 1e-6 && pi > rmax {
+                        rmax = pi;
+                        rdist = pm - amz;
+                    }
+                }
+                writeln!(
+                    w,
+                    "{:.5}\t{:.1}\t{}\t{}\t{:.5}\t{:.5}\t{:.5}\t{:.1}\t{:.5}\t{:.1}\t{:.5}",
+                    amz, apex.intensity, f.charge, f.peaks.len(), mzmin, mzmax, mzmax - mzmin,
+                    lmax, ldist, rmax, rdist
+                )
+                .unwrap();
+            }
+            let _ = w.flush();
+        }
+        eprintln!(
+            "  MZ_STRADDLE: reach_mz={:.2} Da, seed floor={:.0}; wrote per-feature envelope spans -> {spath}",
+            reach_mz, params.min_seed_intensity
+        );
+        return;
+    }
 
     // Escape hatch for diagnostics: skip the (potentially intractable at huge feature counts)
     // refine + O(n^2) charge-consensus and stop after detection.

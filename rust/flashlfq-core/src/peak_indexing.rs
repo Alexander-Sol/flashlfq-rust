@@ -279,6 +279,61 @@ impl PeakIndexingEngine {
         best_peak
     }
 
+    /// Finds the tallest peak **not in `claimed`** whose m/z lies in `[mz_lo, mz_hi]` at exactly
+    /// scan `zero_based_scan_index`. Returns a copy, or `None` if the halo holds no unclaimed peak
+    /// at that scan.
+    ///
+    /// This backs the 2-D tiling detector's **seed re-anchoring** (see `trace_kernel`, §6a): a seed
+    /// sitting within `reach_mz` of an m/z tile border may be a *minor* isotope tooth whose true
+    /// envelope apex lies across the border. Before seeding it, the detector searches this m/z halo
+    /// at the seed's apex scan (isotope teeth of one envelope co-occur in a single scan) for the
+    /// tallest unclaimed peak and processes that first — enforcing "the taller peak goes first"
+    /// locally, exactly as the serial global tallest-first order does. Scans the m/z bins overlapping
+    /// the halo, binary-searching each to the target scan; the per-bin scan run is short (one scan).
+    pub fn tallest_unclaimed_in_mz_at_scan(
+        &self,
+        mz_lo: f64,
+        mz_hi: f64,
+        zero_based_scan_index: i32,
+        claimed: &HashSet<PeakKey>,
+    ) -> Option<IndexedMassSpectralPeak> {
+        let lo_bin = (mz_lo * BINS_PER_DALTON).floor() as i64;
+        let hi_bin = (mz_hi * BINS_PER_DALTON).ceil() as i64;
+        let mut best: Option<IndexedMassSpectralPeak> = None;
+        for j in lo_bin..=hi_bin {
+            if j < 0 || j as usize >= self.indexed_peaks.len() {
+                continue;
+            }
+            let bin = match &self.indexed_peaks[j as usize] {
+                Some(b) => b,
+                None => continue,
+            };
+            let start = Self::binary_search_for_indexed_peak(bin, zero_based_scan_index);
+            if start < 0 {
+                continue;
+            }
+            for p in &bin[start as usize..] {
+                if p.zero_based_scan_index < zero_based_scan_index {
+                    continue;
+                }
+                if p.zero_based_scan_index > zero_based_scan_index {
+                    break; // bin is scan-ascending; past the target scan
+                }
+                let mz = p.m() as f64;
+                if mz < mz_lo || mz > mz_hi {
+                    continue;
+                }
+                if claimed.contains(&peak_key(p)) {
+                    continue;
+                }
+                if best.map_or(true, |b| p.intensity > b.intensity) {
+                    best = Some(*p);
+                }
+            }
+        }
+        best
+    }
+
     /// Traces a peak of m/z `m` across retention time, beginning at the scan just before
     /// `retention_time`. Faithful port of `IndexingEngine<T>.GetXic`.
     ///
