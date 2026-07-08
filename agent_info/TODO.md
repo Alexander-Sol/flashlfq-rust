@@ -76,6 +76,20 @@ CA/Lumos 10-min. Broken into the tasks below.
   optimizations and design a parallelization strategy — evaluate per-file-on-its-own-thread (likely
   simplest/effective) vs. intra-file parallelism. The longer files above make this urgent.
 
+### Data-dependent seed-intensity floor
+- [ ] **[high] Set `MIN_SEED_INTENSITY` data-dependently instead of the hard-coded 1000.**
+  Today the detector walks all peaks tallest-first and stops at a fixed global floor
+  (`min_seed_intensity`, default **1000**) — that floor, not `COVERAGE_TARGET`, is what actually
+  bounds an "uncapped" run. **1000 is too low for the medium/long files:** it admits a large tail of
+  near-noise seeds that are almost all rejected (wasted compute), and it does not adapt per file. Set
+  it from the data instead — e.g. off the estimated noise floor (`estimate_noise_floor`) or an
+  intensity percentile — mirroring the FWHM-derived averaging window. Evidence from the reject-cap A/B
+  (2026-07-08 reject-cap runs): at floor 1000 an uncapped run explained only
+  **90.0% / 90.2% ΣTIC** on the 10-min / 65-min (2-hr 96.5%) — the missing ~10% is sub-1000 peaks
+  never seeded. The per-tile reject-rate cap is a crude *adaptive* proxy for the same goal (skip the
+  noise tail), but a principled per-file seed floor is the real fix. Coordinate with the reject-cap
+  default-`frac` decision — they trade off against each other.
+
 ## Medium priority
 
 - [ ] **[med] Turn averaging off completely via params.**

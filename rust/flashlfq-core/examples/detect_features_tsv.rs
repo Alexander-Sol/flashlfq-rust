@@ -378,16 +378,19 @@ fn main() {
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(1e-7);
-    // Auto-stop at the seed-rejection-rate threshold (opt-in; default OFF). DETECT_REJECT_STOP=1
-    // enables it; stops once the rolling fraction of considered seeds being rejected reaches
-    // DETECT_REJECT_FRAC (default 0.50) over a window of DETECT_REJECT_WINDOW scored seeds
-    // (default 20000). Self-referential (keys on the detector's own hit-rate), unlike the TIC knee.
+    // Auto-stop at the seed-rejection-rate threshold (opt-in; default OFF — the detector ships UNCAPPED).
+    // DETECT_REJECT_STOP=1 enables it; stops once the rolling fraction of considered seeds being rejected
+    // reaches DETECT_REJECT_FRAC (default 0.80) over the reject window. On the parallel paths the window is
+    // sized from data per tile (DETECT_TILE2D_REJECT_WINDOW_FRAC, default 5%); on serial it is
+    // DETECT_REJECT_WINDOW scored seeds (default 20000). A 2026-07-08 A/B (see trace_kernel
+    // reject_stop_enabled docs) found the cap not worth the recall cost, so it stays off by default; the
+    // defaults here are the best setting found, for callers who opt in for detect speed on large files.
     let reject_stop_enabled =
         matches!(std::env::var("DETECT_REJECT_STOP").as_deref(), Ok("1") | Ok("true"));
     let reject_stop_frac = std::env::var("DETECT_REJECT_FRAC")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.50);
+        .unwrap_or(0.80);
     let reject_stop_window = std::env::var("DETECT_REJECT_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -421,8 +424,10 @@ fn main() {
     }
     if reject_stop_enabled {
         eprintln!(
-            "reject-rate auto-stop: ENABLED (window {} scored seeds, frac {:.2}) — stops when that fraction of considered seeds is being rejected",
-            reject_stop_window, reject_stop_frac
+            "reject-rate auto-stop: ENABLED (frac {:.2}; serial rolling window {} scored seeds; the \
+             parallel paths size each tile's window from data via DETECT_TILE2D_REJECT_WINDOW_FRAC) — \
+             stops when that fraction of considered seeds is being rejected",
+            reject_stop_frac, reject_stop_window
         );
     }
     eprintln!(

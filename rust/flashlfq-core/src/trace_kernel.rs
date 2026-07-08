@@ -171,16 +171,32 @@ pub struct TraceKernelParameters {
     /// Absolute floor on the rolling slope (fraction of ΣTIC per seed) below which the tail is flat
     /// enough to stop regardless of the relative test.
     pub knee_abs_eps: f64,
-    /// **Opt-in, default `false`.** Auto-stop the seed walk once the rolling fraction of *considered*
-    /// (scored) seeds that get rejected exceeds [`Self::reject_stop_frac`]. Unlike the TIC knee this
-    /// keys on the detector's own hit-rate — a self-referential, machine/sample-portable signal — and
-    /// fires where the tail turns mostly to noise (persistence-rejected single-scan spikes). A
-    /// speed/recall knob, not a correctness fix.
+    /// **Opt-in, default `false` — the shipped detector runs UNCAPPED.** Auto-stop the seed walk once the
+    /// rolling fraction of *considered* (scored) seeds that get rejected exceeds [`Self::reject_stop_frac`].
+    /// Unlike the TIC knee this keys on the detector's own hit-rate — a self-referential,
+    /// machine/sample-portable signal — and fires where the tail turns mostly to noise
+    /// (persistence-rejected single-scan spikes). On the parallel paths it is applied **per tile** (see
+    /// [`tile_reject_cfg`] / [`detect_bin`]), which is what lets a capped run stay parallel. A speed/recall
+    /// knob, not a correctness fix.
+    ///
+    /// **Why it defaults off (2026-07-08 A/B, `COVERAGE_TARGET=1.0`, 2-D tiling path, PSM-recall vs the
+    /// uncapped baseline on 10-min CA / 65-min glyco / 2-hr IonStar).** At the best setting found
+    /// (`frac 0.80`, `window_frac 0.05`) the cap cost **−0.8 / −1.9 / −0.2 pp recall** for only a
+    /// **1.48× / 1.44× / 1.35× detect** speedup; the fragmented glyco file was always the worst case
+    /// because much of its *real* low-abundance signal lives exactly where a tile's local reject rate
+    /// crosses the threshold. `frac 0.50` over-cut badly (−9 pp on two of three files). The recall loss
+    /// tracks the ΣTIC loss, i.e. the cap removes genuine explained signal, not just noise. **Verdict: not
+    /// worth it — ship uncapped.** Kept opt-in for callers that want to trade recall for detect speed on
+    /// large files. NB: the *real* bound on an "uncapped" run is [`Self::min_seed_intensity`], not this
+    /// cap; a data-dependent seed floor (see `agent_info/TODO.md`) is the better lever and the intended
+    /// successor to this experiment.
     pub reject_stop_enabled: bool,
-    /// Width (in scored seeds) of the rolling window over which the reject fraction is measured.
+    /// Width (in scored seeds) of the rolling window over which the reject fraction is measured *on the
+    /// serial path*. The parallel paths size each tile's window from data instead — see
+    /// [`tile_reject_cfg`] and `DETECT_TILE2D_REJECT_WINDOW_FRAC`.
     pub reject_stop_window: usize,
-    /// Stop when the window's reject fraction reaches this value (e.g. `0.50` = half of considered
-    /// seeds being discarded).
+    /// Stop when the window's reject fraction reaches this value. Default `0.80` (the A/B sweet spot; see
+    /// [`Self::reject_stop_enabled`]) — `0.50` was too eager and over-cut real low-abundance features.
     pub reject_stop_frac: f64,
 }
 
@@ -215,7 +231,7 @@ impl Default for TraceKernelParameters {
             knee_abs_eps: 1e-7,
             reject_stop_enabled: false,
             reject_stop_window: 20_000,
-            reject_stop_frac: 0.50,
+            reject_stop_frac: 0.80,
         }
     }
 }
@@ -1009,6 +1025,58 @@ impl RejectStop {
         self.win_start_rejected = rejected;
         rate >= self.frac
     }
+
+    /// Build a fresh loop-local instance. `window` is resolved per tile from the tile's own walked-seed
+    /// count (see [`detect_bin`]), so every tile scales its rolling window to how many seeds it actually
+    /// considers — the windows are independent per tile (they run on separate threads, never shared).
+    fn new(enabled: bool, window: u64, frac: f64) -> Self {
+        Self {
+            enabled,
+            window: window.max(1),
+            frac,
+            win_start_scored: 0,
+            win_start_rejected: 0,
+            last_rate: 0.0,
+        }
+    }
+}
+
+/// Per-tile configuration for the reject-rate auto-stop on the parallel detectors. `Copy` so each tile's
+/// [`detect_bin`] constructs its OWN [`RejectStop`] from it — the windows are independent per tile (that
+/// is exactly what makes the cap compose with the parallel schedule: no global ΣTIC, no cross-tile
+/// coordination, unlike the coverage-target and knee stops).
+///
+/// `window_frac` is the rolling-window width as a **fraction of the tile's own walked-seed count**
+/// (data-dependent), resolved to an absolute seed count inside [`detect_bin`]; `frac` is the reject-rate
+/// threshold at which the tile stops.
+#[derive(Clone, Copy)]
+struct RejectStopCfg {
+    enabled: bool,
+    window_frac: f64,
+    frac: f64,
+}
+
+impl RejectStopCfg {
+    /// The cap turned off — the serial reference and every test that does not exercise it pass this.
+    const DISABLED: Self = Self {
+        enabled: false,
+        window_frac: 0.0,
+        frac: 1.0,
+    };
+}
+
+/// What happened to one seed run through [`process_seed`]. The three-way split lets the per-tile
+/// reject-rate cap count **only genuine no-signal rejections** — a seed skipped because a neighbour tile
+/// (via strip-seed) or a re-anchored apex already claimed its peaks is not evidence the tail has turned to
+/// noise, and counting it would make border/late-colour tiles stop prematurely and under-detect.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SeedOutcome {
+    /// A feature was emitted.
+    Accepted,
+    /// The seed was scored but yielded no persistent envelope (persistence or envelope/isotope gate).
+    RejectedNoSignal,
+    /// The seed's peaks were already claimed; nothing was scored. Invisible to the reject-rate cap.
+    SkippedClaimed,
 }
 
 /// Runs the untargeted MS1 detector.
@@ -1020,22 +1088,28 @@ impl RejectStop {
 /// even-indexed bins are detected in parallel, then odd-indexed bins in parallel, so no two
 /// concurrently-processed bins can claim the same peaks. That path is **not** bit-identical to the
 /// serial greedy — features straddling a bin boundary can be claimed by the earlier phase regardless
-/// of global intensity order — so it is opt-in and disabled whenever a global-stopping heuristic
-/// (coverage target < 1, knee stop, reject stop) is engaged, since those do not compose with binning.
+/// of global intensity order — so it is opt-in and disabled whenever a *global* stopping heuristic
+/// (coverage target < 1, knee stop) is engaged, since those need a global ΣTIC and do not compose with
+/// binning. The **reject-rate** stop is the exception — being self-referential it is applied per bin/tile
+/// (see [`detect_bin`] / [`tile_reject_cfg`]), so a reject-capped run stays on the parallel path.
 pub fn detect_features(
     engine: &PeakIndexingEngine,
     params: &TraceKernelParameters,
 ) -> Vec<DetectedFeature> {
     let tile2d_requested = std::env::var("DETECT_TILE2D").is_ok();
     let parallel_requested = std::env::var("DETECT_PARALLEL").is_ok();
-    let global_stop_engaged =
-        params.coverage_target < 1.0 || params.knee_stop_enabled || params.reject_stop_enabled;
+    // The coverage target and knee stops need a *global* running ΣTIC, so they cannot be evaluated inside
+    // an independent tile and force the serial path. The reject-rate stop is deliberately NOT here: it is
+    // self-referential (a tile's own scored-seed reject fraction) and is instead applied per-tile inside
+    // [`detect_bin`] via [`tile_reject_cfg`], so a reject-capped run stays parallel.
+    let global_stop_engaged = params.coverage_target < 1.0 || params.knee_stop_enabled;
     // The 2-D m/z×RT tiling path takes precedence over the 1-D RT-binning path when both are set.
     if tile2d_requested {
         if global_stop_engaged {
             eprintln!(
-                "[DETECT_TILE2D] ignored: a global-stop heuristic (coverage target < 1, knee, or \
-                 reject stop) is engaged, which does not compose with 2-D tiling — using the serial path."
+                "[DETECT_TILE2D] ignored: a global-stop heuristic (coverage target < 1, or knee) is \
+                 engaged, which does not compose with 2-D tiling — using the serial path. (The \
+                 reject-rate stop DOES compose and is applied per tile.)"
             );
         } else if let Some(features) = detect_features_tile2d(engine, params) {
             return features;
@@ -1044,8 +1118,9 @@ pub fn detect_features(
     if parallel_requested {
         if global_stop_engaged {
             eprintln!(
-                "[DETECT_PARALLEL] ignored: a global-stop heuristic (coverage target < 1, knee, or \
-                 reject stop) is engaged, which does not compose with RT binning — using the serial path."
+                "[DETECT_PARALLEL] ignored: a global-stop heuristic (coverage target < 1, or knee) is \
+                 engaged, which does not compose with RT binning — using the serial path. (The \
+                 reject-rate stop DOES compose and is applied per bin.)"
             );
         } else if let Some(features) = detect_features_parallel(engine, params) {
             return features;
@@ -1371,6 +1446,37 @@ const DETECT_TILE_MZ_WIDTH_DALTONS: f64 = 96.0;
 /// Overridable via `DETECT_TILE2D_REACH_MZ`.
 const DETECT_TILE_REACH_MZ_DALTONS: f64 = 4.0;
 
+/// Default rolling-window width for the **per-tile** reject-rate auto-stop on the parallel detectors, as a
+/// **fraction of each tile's own walked-seed count** (data-dependent). A fixed count cannot serve tiles
+/// that span three orders of magnitude in seed count (short-gradient tiles vs. fragmented-glyco tiles); a
+/// fraction sizes each tile's window to how many seeds it actually walks. Overridable via
+/// `DETECT_TILE2D_REJECT_WINDOW_FRAC`. Only consulted when the run enables the reject stop
+/// (`reject_stop_enabled`, itself off by default); the reject-fraction threshold is shared with the serial
+/// path (`reject_stop_frac`). Default `0.05` = the A/B sweet spot (see [`TraceKernelParameters::reject_stop_enabled`]):
+/// 1% was faster but roughly doubled the recall cost on the fragmented glyco file.
+const DETECT_TILE_REJECT_WINDOW_FRAC: f64 = 0.05;
+
+/// Build the per-tile reject-rate cap config for the parallel paths from the run params. Disabled unless
+/// the run requested the reject stop; when enabled, uses the data-dependent window fraction (default
+/// [`DETECT_TILE_REJECT_WINDOW_FRAC`], overridable via `DETECT_TILE2D_REJECT_WINDOW_FRAC`) and the run's
+/// `reject_stop_frac`. This is what lets a *capped* run stay on the parallel path instead of falling back
+/// to serial — the cap is applied independently inside each tile's [`detect_bin`].
+fn tile_reject_cfg(params: &TraceKernelParameters) -> RejectStopCfg {
+    if !params.reject_stop_enabled {
+        return RejectStopCfg::DISABLED;
+    }
+    let window_frac = std::env::var("DETECT_TILE2D_REJECT_WINDOW_FRAC")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v > 0.0 && v <= 1.0)
+        .unwrap_or(DETECT_TILE_REJECT_WINDOW_FRAC);
+    RejectStopCfg {
+        enabled: true,
+        window_frac,
+        frac: params.reject_stop_frac,
+    }
+}
+
 /// The maximum RT half-width (minutes) any single seed's scoring or claim-trace reaches from its
 /// apex. A feature seeded in one bin can therefore touch peaks at most this far into an adjacent bin,
 /// and no further. The scoring window is `rt_half_window_minutes`; the claim-extent trace is capped
@@ -1502,6 +1608,9 @@ fn detect_features_parallel(
     bin_edges.push(rt_max + 1.0);
 
     let reach = bin_reach_minutes(params);
+    // Per-bin reject-rate cap (opt-in): each bin stops its own noise tail independently, so a capped run
+    // stays parallel instead of falling back to serial. Disabled cfg when the run didn't request it.
+    let reject = tile_reject_cfg(params);
 
     // --- Phase 0: even bins in parallel, each with a fresh (empty) claim set. ----------------------
     let even_indices: Vec<usize> = (0..n_bins).step_by(2).collect();
@@ -1510,7 +1619,7 @@ fn detect_features_parallel(
         .map(|&b| {
             let (lo, hi) = ranges[b];
             let (features, claimed) =
-                detect_bin(engine, params, &ppm, &ordered[lo..hi], HashSet::new(), None);
+                detect_bin(engine, params, &ppm, &ordered[lo..hi], HashSet::new(), None, reject);
             (b, features, claimed)
         })
         .collect();
@@ -1535,7 +1644,8 @@ fn detect_features_parallel(
             let e = claim_rts.partition_point(|&r| r <= hi_rt);
             let seeded: HashSet<PeakKey> = even_claims[s..e].iter().map(|p| p.key()).collect();
             let (lo, hi) = ranges[b];
-            let (features, _) = detect_bin(engine, params, &ppm, &ordered[lo..hi], seeded, None);
+            let (features, _) =
+                detect_bin(engine, params, &ppm, &ordered[lo..hi], seeded, None, reject);
             (b, features)
         })
         .collect();
@@ -1774,6 +1884,11 @@ fn detect_features_tile2d(
     let mut global_claimed: HashSet<PeakKey> = HashSet::new();
     let mut collisions = 0usize;
 
+    // Per-tile reject-rate cap (opt-in): each tile stops its own noise tail independently. This is what
+    // keeps a capped run on the 2-D path — the coverage/knee stops can't (they need a global ΣTIC), but
+    // the reject rate is self-referential per tile. Disabled cfg when the run didn't request it.
+    let reject = tile_reject_cfg(params);
+
     for color in 0..4u8 {
         let tiles: Vec<usize> = (0..n_tiles)
             .filter(|&t| tile_color(t / n_mz, t % n_mz) == color)
@@ -1829,8 +1944,15 @@ fn detect_features_tile2d(
                     mz_hi: mz_edges[i_mz + 1],
                 };
                 let (lo, hi) = ranges[t];
-                let (features, claimed) =
-                    detect_bin(engine, params, &ppm, &ordered[lo..hi], seeded, Some(&reanchor));
+                let (features, claimed) = detect_bin(
+                    engine,
+                    params,
+                    &ppm,
+                    &ordered[lo..hi],
+                    seeded,
+                    Some(&reanchor),
+                    reject,
+                );
                 (t, features, claimed)
             })
             .collect();
@@ -1866,10 +1988,19 @@ fn detect_features_tile2d(
         );
     }
     if profile {
+        let reject_desc = if reject.enabled {
+            format!(
+                " | reject: frac {:.2}, window {:.1}% of tile walked-seeds",
+                reject.frac,
+                100.0 * reject.window_frac
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
             "  [DETECT_TILE2D] total {:.2}s | grid {}×{} = {} tiles ({} RT bands, {} m/z cols) | \
              {} threads | reach_rt {:.2} min / reach_mz {:.1} Da (strip pad {:.1} Da) | \
-             mz_width {:.0} Da | collisions {} | features {}",
+             mz_width {:.0} Da | collisions {} | features {}{}",
             t0.elapsed().as_secs_f64(),
             n_rt,
             n_mz,
@@ -1883,6 +2014,7 @@ fn detect_features_tile2d(
             mz_width,
             collisions,
             features.len(),
+            reject_desc,
         );
     }
 
@@ -1924,9 +2056,9 @@ fn process_seed(
     claimed: &mut HashSet<PeakKey>,
     claimed_peaks: &mut Vec<IndexedMassSpectralPeak>,
     features: &mut Vec<DetectedFeature>,
-) {
+) -> SeedOutcome {
     if claimed.contains(&seed.key()) {
-        return;
+        return SeedOutcome::SkippedClaimed;
     }
 
     // Cheap charge-independent persistence pre-gate (same as serial): a seed whose own-m/z XIC
@@ -1936,7 +2068,7 @@ fn process_seed(
         if claimed.insert(seed.key()) {
             claimed_peaks.push(*seed);
         }
-        return;
+        return SeedOutcome::RejectedNoSignal;
     }
 
     let window = seed_rt_window(engine, seed, params);
@@ -1957,13 +2089,13 @@ fn process_seed(
 
     let best = match best {
         Some(b) => b,
-        None => return,
+        None => return SeedOutcome::RejectedNoSignal,
     };
     if best.num_isotopes_observed < params.min_isotopes_observed || best.response <= 0.0 {
         if claimed.insert(seed.key()) {
             claimed_peaks.push(*seed);
         }
-        return;
+        return SeedOutcome::RejectedNoSignal;
     }
 
     let traced = gather_extent_peaks(engine, seed, &best, s_lo, s_hi, params, ppm, claimed);
@@ -1974,7 +2106,7 @@ fn process_seed(
             if claimed.insert(seed.key()) {
                 claimed_peaks.push(*seed);
             }
-            return;
+            return SeedOutcome::RejectedNoSignal;
         }
     }
 
@@ -1984,6 +2116,7 @@ fn process_seed(
         }
     }
     features.push(build_feature(best, traced));
+    SeedOutcome::Accepted
 }
 
 /// Detects features within a single tile (or RT bin): the serial greedy accept/reject loop, run over one
@@ -2000,7 +2133,16 @@ fn process_seed(
 /// Returns the tile's accepted features and **the peaks it newly claimed** (paired with their RT/m-z via the
 /// peak record). The `insert` return value guarantees only genuinely-new keys are reported, so a pre-seeded
 /// key is never echoed back. This mirrors the body of [`detect_features_serial`] minus the global progress /
-/// coverage / knee / reject-stop bookkeeping, which does not compose with per-tile execution.
+/// coverage / knee bookkeeping, which does not compose with per-tile execution.
+///
+/// `reject` is the per-tile reject-rate auto-stop (§ parallel-capping): unlike the coverage/knee stops it
+/// *does* compose with tiling because it is self-referential (fraction of this tile's own scored seeds that
+/// yield no signal) — no global ΣTIC, no cross-tile state. Each tile runs its own rolling window and stops
+/// its tail independently. `RejectStopCfg::DISABLED` (serial reference, 1-D-without-cap, tests) keeps the
+/// loop running to the seed floor exactly as before. Only [`SeedOutcome::RejectedNoSignal`] feeds it —
+/// seeds skipped as already-claimed (a neighbour's strip-seed or a re-anchored apex) must not, or borders
+/// and late colours would stop early.
+#[allow(clippy::too_many_arguments)]
 fn detect_bin(
     engine: &PeakIndexingEngine,
     params: &TraceKernelParameters,
@@ -2008,14 +2150,33 @@ fn detect_bin(
     seeds: &[IndexedMassSpectralPeak],
     mut claimed: HashSet<PeakKey>,
     reanchor: Option<&Reanchor>,
+    reject: RejectStopCfg,
 ) -> (Vec<DetectedFeature>, Vec<IndexedMassSpectralPeak>) {
     let mut features: Vec<DetectedFeature> = Vec::new();
     let mut claimed_peaks: Vec<IndexedMassSpectralPeak> = Vec::new();
+
+    // Per-tile reject-rate auto-stop state. `scored`/`rejected` are this tile's cumulative no-skip counts
+    // (accepted + no-signal, and no-signal alone) — exactly the serial tally, scoped to one tile. The
+    // rolling window is sized from THIS tile's walked-seed count (seeds at/above the intensity floor — the
+    // ones the loop will actually consider), so it is data-dependent and scales with tile size rather than
+    // a fixed count. `seeds` is intensity-descending, so the above-floor count is a partition point.
+    let n_walked = seeds.partition_point(|s| (s.intensity as f64) >= params.min_seed_intensity);
+    let window = (reject.window_frac * n_walked as f64).ceil() as u64;
+    let mut reject_stop = RejectStop::new(reject.enabled, window, reject.frac);
+    let mut scored: u64 = 0;
+    let mut rejected: u64 = 0;
 
     for seed in seeds {
         // Seeds are intensity-descending within the tile, so once one falls below the floor every
         // remaining seed does too.
         if (seed.intensity as f64) < params.min_seed_intensity {
+            break;
+        }
+
+        // Once this tile's rolling reject fraction crosses the threshold its tail has turned to noise —
+        // stop. Checked before the seed (as in serial) so it fires even mid-run of consecutive rejects.
+        // A no-op returning false when the cap is disabled.
+        if reject_stop.observe(scored, rejected) {
             break;
         }
 
@@ -2035,7 +2196,7 @@ fn detect_bin(
                     &claimed,
                 ) {
                     if apex.key() != seed.key() {
-                        process_seed(
+                        let outcome = process_seed(
                             engine,
                             params,
                             ppm,
@@ -2044,12 +2205,13 @@ fn detect_bin(
                             &mut claimed_peaks,
                             &mut features,
                         );
+                        tally_seed_outcome(outcome, &mut scored, &mut rejected);
                     }
                 }
             }
         }
 
-        process_seed(
+        let outcome = process_seed(
             engine,
             params,
             ppm,
@@ -2058,9 +2220,25 @@ fn detect_bin(
             &mut claimed_peaks,
             &mut features,
         );
+        tally_seed_outcome(outcome, &mut scored, &mut rejected);
     }
 
     (features, claimed_peaks)
+}
+
+/// Fold one [`SeedOutcome`] into a tile's `(scored, rejected)` reject-rate counters. Mirrors the serial
+/// tally: a scored seed is one that was not skipped-as-claimed; a rejected seed is a scored one that
+/// produced no feature. `SkippedClaimed` touches neither, so it is invisible to the reject-rate cap.
+#[inline]
+fn tally_seed_outcome(outcome: SeedOutcome, scored: &mut u64, rejected: &mut u64) {
+    match outcome {
+        SeedOutcome::Accepted => *scored += 1,
+        SeedOutcome::RejectedNoSignal => {
+            *scored += 1;
+            *rejected += 1;
+        }
+        SeedOutcome::SkippedClaimed => {}
+    }
 }
 
 /// Assembles a [`DetectedFeature`] from an accepted hypothesis and its **traced** peak set (Change A).
@@ -2749,6 +2927,78 @@ mod tests {
     }
 
     #[test]
+    fn per_tile_reject_cap_counts_only_no_signal_rejects() {
+        // The per-tile reject-rate cap must count only genuine no-signal rejections. This locks the one
+        // subtle invariant: a seed skipped because a neighbour (strip-seed) or a re-anchored apex already
+        // claimed its peaks is NOT evidence the tail turned to noise, and must not advance the window —
+        // else border/late-colour tiles would stop early and under-detect. `window` here is the absolute
+        // per-tile window that `detect_bin` would resolve from the tile's walked-seed count.
+        let (window, frac) = (10u64, 0.5f64);
+
+        // 1) A thousand SkippedClaimed outcomes advance neither counter and never trip the cap.
+        let mut rs = RejectStop::new(true, window, frac);
+        let (mut scored, mut rejected) = (0u64, 0u64);
+        for _ in 0..1000 {
+            assert!(
+                !rs.observe(scored, rejected),
+                "skipped-claimed seeds must not trip the per-tile cap"
+            );
+            tally_seed_outcome(SeedOutcome::SkippedClaimed, &mut scored, &mut rejected);
+        }
+        assert_eq!(
+            (scored, rejected),
+            (0, 0),
+            "SkippedClaimed advances neither the scored nor the rejected counter"
+        );
+
+        // 2) A full window of no-signal rejects (100% > 50%) trips exactly when the window first fills.
+        let mut rs = RejectStop::new(true, window, frac);
+        let (mut scored, mut rejected) = (0u64, 0u64);
+        let mut tripped_at = None;
+        for i in 0..25u64 {
+            if rs.observe(scored, rejected) {
+                tripped_at = Some(i);
+                break;
+            }
+            tally_seed_outcome(SeedOutcome::RejectedNoSignal, &mut scored, &mut rejected);
+        }
+        assert_eq!(
+            tripped_at,
+            Some(10),
+            "cap trips at the first full window of all-reject seeds"
+        );
+
+        // 3) A window at exactly the fraction (5 rejects / 10 scored = 0.5) trips (rate >= frac).
+        let mut rs = RejectStop::new(true, window, frac);
+        let (mut scored, mut rejected) = (0u64, 0u64);
+        let mut tripped = false;
+        for i in 0..40u64 {
+            if rs.observe(scored, rejected) {
+                tripped = true;
+                break;
+            }
+            let o = if i % 2 == 0 {
+                SeedOutcome::RejectedNoSignal
+            } else {
+                SeedOutcome::Accepted
+            };
+            tally_seed_outcome(o, &mut scored, &mut rejected);
+        }
+        assert!(tripped, "a window at exactly frac (0.5) must trip");
+
+        // 4) A DISABLED cap never trips, even on an all-reject stream.
+        let mut rs = RejectStop::new(false, 1, 1.0);
+        let (mut scored, mut rejected) = (0u64, 0u64);
+        for _ in 0..1000 {
+            assert!(
+                !rs.observe(scored, rejected),
+                "disabled per-tile cap must never trip"
+            );
+            tally_seed_outcome(SeedOutcome::RejectedNoSignal, &mut scored, &mut rejected);
+        }
+    }
+
+    #[test]
     fn reanchoring_recovers_apex_when_seeded_from_minor_tooth() {
         // §6a: a clean z=2 envelope whose monoisotope is the most-abundant tooth (the apex). Seed the
         // detector from the +1 *minor* tooth alone — exactly what an m/z tile border does when the apex
@@ -2786,12 +3036,26 @@ mod tests {
 
         // Seed from the minor tooth, re-anchoring ON.
         let re_b = ctx(&plus1_peak);
-        let (feat_b, _) =
-            detect_bin(&engine, &params, &ppm, &[plus1_peak], HashSet::new(), Some(&re_b));
+        let (feat_b, _) = detect_bin(
+            &engine,
+            &params,
+            &ppm,
+            &[plus1_peak],
+            HashSet::new(),
+            Some(&re_b),
+            RejectStopCfg::DISABLED,
+        );
         // Seed from the apex, re-anchoring ON — the order-independence reference.
         let re_a = ctx(&mono_peak);
-        let (feat_a, _) =
-            detect_bin(&engine, &params, &ppm, &[mono_peak], HashSet::new(), Some(&re_a));
+        let (feat_a, _) = detect_bin(
+            &engine,
+            &params,
+            &ppm,
+            &[mono_peak],
+            HashSet::new(),
+            Some(&re_a),
+            RejectStopCfg::DISABLED,
+        );
 
         assert_eq!(feat_b.len(), 1, "re-anchored minor-tooth seed yields exactly one feature");
         assert_eq!(feat_a.len(), 1);
@@ -2803,8 +3067,15 @@ mod tests {
 
         // Contrast: WITHOUT re-anchoring the minor-tooth seed mis-places the mono (off by ~1 unit),
         // so it must NOT recover 1200 — proving re-anchoring is what fixes the straddle.
-        let (feat_none, _) =
-            detect_bin(&engine, &params, &ppm, &[plus1_peak], HashSet::new(), None);
+        let (feat_none, _) = detect_bin(
+            &engine,
+            &params,
+            &ppm,
+            &[plus1_peak],
+            HashSet::new(),
+            None,
+            RejectStopCfg::DISABLED,
+        );
         assert!(
             feat_none.is_empty() || (feat_none[0].monoisotopic_mass - 1200.0).abs() > 0.1,
             "without re-anchoring the minor-tooth seed should mis-place the mono, got {:?}",
