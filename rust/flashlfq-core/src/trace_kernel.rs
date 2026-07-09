@@ -1500,10 +1500,15 @@ fn scan_bounds_for_rt(scan_info: &[ScanInfo], rt_lo: f64, rt_hi: f64) -> (i32, i
     (scan_lo, scan_hi)
 }
 
-/// Whether the opt-in zero-copy [`PeakIndexView`] narrowing is enabled (`DETECT_INDEX_VIEW`). Off by
-/// default: the parallel paths pass the full shared engine, exactly as before.
+/// Whether the zero-copy [`PeakIndexView`] narrowing is active. **On by default** — it is a
+/// byte-identical detect speedup (≈1.43× on the 65-min 2-D path; the narrowed per-tile slices give the
+/// hot lookups shorter, cache-local binary searches). Opt out with `DETECT_INDEX_VIEW=0` (or `false`)
+/// to fall back to the full shared engine.
 fn index_view_enabled() -> bool {
-    std::env::var("DETECT_INDEX_VIEW").is_ok()
+    !matches!(
+        std::env::var("DETECT_INDEX_VIEW").as_deref(),
+        Ok("0") | Ok("false")
+    )
 }
 
 /// Intra-file red-black RT-binning detector (opt-in; see [`detect_features`]). Returns `None` when the
@@ -1629,9 +1634,9 @@ fn detect_features_parallel(
     // Per-bin reject-rate cap (opt-in): each bin stops its own noise tail independently, so a capped run
     // stays parallel instead of falling back to serial. Disabled cfg when the run didn't request it.
     let reject = tile_reject_cfg(params);
-    // Opt-in zero-copy narrowing: each bin runs against a [`PeakIndexView`] restricted to its RT span ±
-    // `reach` (full m/z — the 1-D path tiles RT only), so the hot lookups binary-search short scan-window
-    // slices instead of whole-run bins. Off by default → the full shared engine, byte-identical.
+    // Zero-copy narrowing (on by default; DETECT_INDEX_VIEW=0 opts out): each bin runs against a
+    // [`PeakIndexView`] restricted to its RT span ± `reach` (full m/z — the 1-D path tiles RT only), so
+    // the hot lookups binary-search short scan-window slices instead of whole-run bins. Byte-identical.
     let use_view = index_view_enabled();
 
     // --- Phase 0: even bins in parallel, each with a fresh (empty) claim set. ----------------------
@@ -1922,10 +1927,10 @@ fn detect_features_tile2d(
     // keeps a capped run on the 2-D path — the coverage/knee stops can't (they need a global ΣTIC), but
     // the reject rate is self-referential per tile. Disabled cfg when the run didn't request it.
     let reject = tile_reject_cfg(params);
-    // Opt-in zero-copy narrowing: each tile runs against a [`PeakIndexView`] restricted to its padded
-    // m/z × RT box, so the hot lookups binary-search short slices. The box is exactly the strip-pad /
-    // reach margin the tiling already enforces, so the view is a strict superset of every query the tile
-    // makes → byte-identical output. Off by default → the full shared engine.
+    // Zero-copy narrowing (on by default; DETECT_INDEX_VIEW=0 opts out): each tile runs against a
+    // [`PeakIndexView`] restricted to its padded m/z × RT box, so the hot lookups binary-search short
+    // slices. The box is exactly the strip-pad / reach margin the tiling already enforces, so the view is
+    // a strict superset of every query the tile makes → byte-identical output.
     let use_view = index_view_enabled();
 
     for color in 0..4u8 {
