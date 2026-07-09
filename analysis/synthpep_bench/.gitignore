@@ -1,0 +1,6 @@
+# Bulk detector outputs & intermediates -- regenerable, NOT committed.
+# Regenerate with dino_full.ps1 / ours_full.ps1 / prep_notebook_data.py.
+ours/
+dino/
+prelim/
+nb_data/
