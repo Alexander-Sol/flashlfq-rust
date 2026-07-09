@@ -44,7 +44,9 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::isotopic_envelope::{C13_MINUS_C12, PROTON_MASS};
-use crate::peak_indexing::{IndexedMassSpectralPeak, PeakIndexingEngine, PeakKey, ScanInfo};
+use crate::peak_indexing::{
+    IndexedMassSpectralPeak, PeakIndexingEngine, PeakKey, PeakSource, ScanInfo,
+};
 use crate::tolerance::PpmTolerance;
 
 /// Poisson rate per dalton for the closed-form comb: `λ ≈ 0.00048·M`. This is (carbons per Da)
@@ -553,7 +555,7 @@ struct HypothesisScore {
 /// This is **charge-independent**, so `detect_features` computes it once per seed and shares it
 /// across every charge hypothesis (the Gaussian weight likewise depends only on the seed apex).
 fn seed_rt_window(
-    engine: &PeakIndexingEngine,
+    engine: &impl PeakSource,
     seed: &IndexedMassSpectralPeak,
     params: &TraceKernelParameters,
 ) -> Vec<(i32, f64)> {
@@ -586,7 +588,7 @@ fn seed_rt_window(
 /// `window` is the seed's precomputed [`seed_rt_window`] — `(scan_index, gaussian_weight)` pairs,
 /// shared across all charge hypotheses of the same seed.
 fn score_hypothesis(
-    engine: &PeakIndexingEngine,
+    engine: &impl PeakSource,
     seed: &IndexedMassSpectralPeak,
     charge: i32,
     params: &TraceKernelParameters,
@@ -763,7 +765,7 @@ pub fn estimate_noise_floor(engine: &PeakIndexingEngine, percentile: f64) -> f64
 /// without paying for the (six-charge) envelope scoring — that is where most of the tail's wasted
 /// compute goes (the persistence gate, not the envelope gate, rejects the bulk of low-abundance seeds).
 fn trace_seed_extent(
-    engine: &PeakIndexingEngine,
+    engine: &impl PeakSource,
     seed: &IndexedMassSpectralPeak,
     params: &TraceKernelParameters,
     ppm: &PpmTolerance,
@@ -794,7 +796,7 @@ fn trace_seed_extent(
 /// the accepted hypothesis (charge + monoisotopic m/z), so it runs after scoring; the extent it walks
 /// is the one [`trace_seed_extent`] already fixed (no second XIC walk).
 fn gather_extent_peaks(
-    engine: &PeakIndexingEngine,
+    engine: &impl PeakSource,
     seed: &IndexedMassSpectralPeak,
     hyp: &HypothesisScore,
     s_lo: i32,
@@ -1481,6 +1483,29 @@ fn bin_reach_minutes(params: &TraceKernelParameters) -> f64 {
         .max(params.trace_max_half_width_minutes)
 }
 
+/// Inclusive `[scan_lo, scan_hi]` zero-based scan indices covering every scan whose RT falls in
+/// `[rt_lo, rt_hi]`, plus a one-scan guard each side. `scan_info` is RT-ascending. Used to size a
+/// [`PeakIndexView`]'s scan window to a tile's padded RT box: every scan any of the tile's queries can
+/// walk to lies within `rt_lo..rt_hi` (the box already carries the ± reach margin), so the guarded
+/// window is a strict superset of the queried scans and the view returns identical results.
+fn scan_bounds_for_rt(scan_info: &[ScanInfo], rt_lo: f64, rt_hi: f64) -> (i32, i32) {
+    let n = scan_info.len();
+    if n == 0 {
+        return (0, -1);
+    }
+    let lo = scan_info.partition_point(|s| s.retention_time < rt_lo);
+    let hi = scan_info.partition_point(|s| s.retention_time <= rt_hi);
+    let scan_lo = (lo as i64 - 1).max(0) as i32;
+    let scan_hi = (hi as i64).min(n as i64 - 1) as i32;
+    (scan_lo, scan_hi)
+}
+
+/// Whether the opt-in zero-copy [`PeakIndexView`] narrowing is enabled (`DETECT_INDEX_VIEW`). Off by
+/// default: the parallel paths pass the full shared engine, exactly as before.
+fn index_view_enabled() -> bool {
+    std::env::var("DETECT_INDEX_VIEW").is_ok()
+}
+
 /// Intra-file red-black RT-binning detector (opt-in; see [`detect_features`]). Returns `None` when the
 /// run is too short to split into ≥ 2 bins, in which case the caller falls back to the serial path.
 ///
@@ -1604,6 +1629,10 @@ fn detect_features_parallel(
     // Per-bin reject-rate cap (opt-in): each bin stops its own noise tail independently, so a capped run
     // stays parallel instead of falling back to serial. Disabled cfg when the run didn't request it.
     let reject = tile_reject_cfg(params);
+    // Opt-in zero-copy narrowing: each bin runs against a [`PeakIndexView`] restricted to its RT span ±
+    // `reach` (full m/z — the 1-D path tiles RT only), so the hot lookups binary-search short scan-window
+    // slices instead of whole-run bins. Off by default → the full shared engine, byte-identical.
+    let use_view = index_view_enabled();
 
     // --- Phase 0: even bins in parallel, each with a fresh (empty) claim set. ----------------------
     let even_indices: Vec<usize> = (0..n_bins).step_by(2).collect();
@@ -1611,8 +1640,14 @@ fn detect_features_parallel(
         .par_iter()
         .map(|&b| {
             let (lo, hi) = ranges[b];
-            let (features, claimed) =
-                detect_bin(engine, params, &ppm, &ordered[lo..hi], HashSet::new(), None, reject);
+            let (features, claimed) = if use_view {
+                let (s_lo, s_hi) =
+                    scan_bounds_for_rt(engine.scan_info(), bin_edges[b] - reach, bin_edges[b + 1] + reach);
+                let view = engine.view_scans(s_lo, s_hi);
+                detect_bin(&view, params, &ppm, &ordered[lo..hi], HashSet::new(), None, reject)
+            } else {
+                detect_bin(engine, params, &ppm, &ordered[lo..hi], HashSet::new(), None, reject)
+            };
             (b, features, claimed)
         })
         .collect();
@@ -1637,8 +1672,13 @@ fn detect_features_parallel(
             let e = claim_rts.partition_point(|&r| r <= hi_rt);
             let seeded: HashSet<PeakKey> = even_claims[s..e].iter().map(|p| p.key()).collect();
             let (lo, hi) = ranges[b];
-            let (features, _) =
-                detect_bin(engine, params, &ppm, &ordered[lo..hi], seeded, None, reject);
+            let (features, _) = if use_view {
+                let (s_lo, s_hi) = scan_bounds_for_rt(engine.scan_info(), lo_rt, hi_rt);
+                let view = engine.view_scans(s_lo, s_hi);
+                detect_bin(&view, params, &ppm, &ordered[lo..hi], seeded, None, reject)
+            } else {
+                detect_bin(engine, params, &ppm, &ordered[lo..hi], seeded, None, reject)
+            };
             (b, features)
         })
         .collect();
@@ -1656,7 +1696,7 @@ fn detect_features_parallel(
     if profile {
         eprintln!(
             "  [DETECT_PARALLEL] total {:.2}s | {} bins ({} even, {} odd) | {} threads | \
-             reach {:.2} min / min-width {:.1} min | features {}",
+             reach {:.2} min / min-width {:.1} min | index {} | features {}",
             t0.elapsed().as_secs_f64(),
             n_bins,
             even_indices.len(),
@@ -1664,6 +1704,7 @@ fn detect_features_parallel(
             threads,
             reach,
             DETECT_BIN_MIN_WIDTH_MINUTES,
+            if use_view { "view" } else { "shared" },
             features.len(),
         );
     }
@@ -1881,6 +1922,11 @@ fn detect_features_tile2d(
     // keeps a capped run on the 2-D path — the coverage/knee stops can't (they need a global ΣTIC), but
     // the reject rate is self-referential per tile. Disabled cfg when the run didn't request it.
     let reject = tile_reject_cfg(params);
+    // Opt-in zero-copy narrowing: each tile runs against a [`PeakIndexView`] restricted to its padded
+    // m/z × RT box, so the hot lookups binary-search short slices. The box is exactly the strip-pad /
+    // reach margin the tiling already enforces, so the view is a strict superset of every query the tile
+    // makes → byte-identical output. Off by default → the full shared engine.
+    let use_view = index_view_enabled();
 
     for color in 0..4u8 {
         let tiles: Vec<usize> = (0..n_tiles)
@@ -1937,15 +1983,29 @@ fn detect_features_tile2d(
                     mz_hi: mz_edges[i_mz + 1],
                 };
                 let (lo, hi) = ranges[t];
-                let (features, claimed) = detect_bin(
-                    engine,
-                    params,
-                    &ppm,
-                    &ordered[lo..hi],
-                    seeded,
-                    Some(&reanchor),
-                    reject,
-                );
+                let (features, claimed) = if use_view {
+                    let (s_lo, s_hi) = scan_bounds_for_rt(engine.scan_info(), box_rt_lo, box_rt_hi);
+                    let view = engine.view_box(box_mz_lo, box_mz_hi, s_lo, s_hi);
+                    detect_bin(
+                        &view,
+                        params,
+                        &ppm,
+                        &ordered[lo..hi],
+                        seeded,
+                        Some(&reanchor),
+                        reject,
+                    )
+                } else {
+                    detect_bin(
+                        engine,
+                        params,
+                        &ppm,
+                        &ordered[lo..hi],
+                        seeded,
+                        Some(&reanchor),
+                        reject,
+                    )
+                };
                 (t, features, claimed)
             })
             .collect();
@@ -1993,7 +2053,7 @@ fn detect_features_tile2d(
         eprintln!(
             "  [DETECT_TILE2D] total {:.2}s | grid {}×{} = {} tiles ({} RT bands, {} m/z cols) | \
              {} threads | reach_rt {:.2} min / reach_mz {:.1} Da (strip pad {:.1} Da) | \
-             mz_width {:.0} Da | collisions {} | features {}{}",
+             mz_width {:.0} Da | index {} | collisions {} | features {}{}",
             t0.elapsed().as_secs_f64(),
             n_rt,
             n_mz,
@@ -2005,6 +2065,7 @@ fn detect_features_tile2d(
             reach_mz,
             strip_pad_mz,
             mz_width,
+            if use_view { "view" } else { "shared" },
             collisions,
             features.len(),
             reject_desc,
@@ -2042,7 +2103,7 @@ impl Reanchor {
 /// appears later as its own tile's seed is processed exactly once).
 #[allow(clippy::too_many_arguments)]
 fn process_seed(
-    engine: &PeakIndexingEngine,
+    engine: &impl PeakSource,
     params: &TraceKernelParameters,
     ppm: &PpmTolerance,
     seed: &IndexedMassSpectralPeak,
@@ -2137,7 +2198,7 @@ fn process_seed(
 /// and late colours would stop early.
 #[allow(clippy::too_many_arguments)]
 fn detect_bin(
-    engine: &PeakIndexingEngine,
+    engine: &impl PeakSource,
     params: &TraceKernelParameters,
     ppm: &PpmTolerance,
     seeds: &[IndexedMassSpectralPeak],
